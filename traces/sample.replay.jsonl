@@ -1,0 +1,4 @@
+{"schema_version":"0.1","event":"trace.start","trace_id":"tr_sample_001","name":"langgraph_basic","metadata":{"framework":"langgraph","prompt_version":"demo-v1"}}
+{"schema_version":"0.1","event":"llm.call","trace_id":"tr_sample_001","span_id":"sp_001","provider":"openai","model":"gpt-4.1-mini","input_hash":"sha256:demo-input","params":{"temperature":0}}
+{"schema_version":"0.1","event":"llm.response","trace_id":"tr_sample_001","span_id":"sp_001","output":{"text":"The demo answer cites the fake tool result."},"output_hash":"sha256:demo-output","usage":{"input_tokens":42,"output_tokens":9},"latency_ms":1180}
+{"schema_version":"0.1","event":"trace.end","trace_id":"tr_sample_001","status":"success","output_hash":"sha256:demo-output"}
