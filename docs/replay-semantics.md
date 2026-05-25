@@ -17,6 +17,10 @@ Replay must fail loudly when:
 
 Silent live fallback is not allowed by default. A future `--allow-live-fallback` flag can exist, but it must be explicit.
 
+## Diffing
+
+Cassette diffing compares two recorded runs and reports replay-relevant divergence before runtime replay exists. The first implementation should focus on event order and LLM exchanges: provider, model, params, input hash, stored output hash, and the hash of recorded response output.
+
 ## Limits
 
 - Replay proves that a previous behavior can be frozen. It does not prove a future live model will behave the same.

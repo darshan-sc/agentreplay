@@ -40,7 +40,7 @@ Every event must include:
 
 ## Validation Rules
 
-The first validator enforces:
+The validator enforces:
 
 - Every line is a valid JSON event.
 - `schema_version` is `0.1`.
@@ -48,5 +48,15 @@ The first validator enforces:
 - The first event is `trace.start`.
 - The final event is `trace.end`.
 - Required fields exist for each event type.
+- Events do not appear after `trace.end`.
+- LLM, tool, and retrieval response events have a prior matching call event.
+- LLM, tool, and retrieval call events receive a matching response.
+- Active spans cannot be reused across event kinds.
 
-Future slices will add canonical hashing, writer support, schema migration, and stricter span relationship checks.
+## Writer and Hashing
+
+The Go cassette package includes a JSONL writer that injects `schema_version` when omitted and validates each event before writing it.
+
+`HashValue` and `HashJSON` produce `sha256:` hashes over canonical JSON so equivalent JSON objects with different whitespace or key order hash identically.
+
+Future slices will add schema migration and broader runtime adapters.

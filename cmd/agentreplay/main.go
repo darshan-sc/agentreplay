@@ -39,7 +39,9 @@ func run(args []string) error {
 		return runValidate(args[1:])
 	case "inspect":
 		return runInspect(args[1:])
-	case "record", "replay", "diff", "generate-tests":
+	case "diff":
+		return runDiff(args[1:])
+	case "record", "replay", "generate-tests":
 		return fmt.Errorf("%q is planned but is not implemented in this slice", args[0])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
@@ -48,6 +50,8 @@ func run(args []string) error {
 		return fmt.Errorf("unknown command %q\n\n%s", args[0], usage)
 	}
 }
+
+var errCassetteDifferences = errors.New("cassette differences found")
 
 func runValidate(args []string) error {
 	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
@@ -111,4 +115,30 @@ func runInspect(args []string) error {
 		fmt.Printf("  line %d: %s\n", issue.Line, issue.Message)
 	}
 	return nil
+}
+
+func runDiff(args []string) error {
+	fs := flag.NewFlagSet("diff", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 2 {
+		return errors.New("usage: agentreplay diff <before.replay.jsonl> <after.replay.jsonl>")
+	}
+
+	report, err := cassette.DiffFiles(fs.Arg(0), fs.Arg(1))
+	if err != nil {
+		return err
+	}
+	if report.Empty() {
+		fmt.Println("No cassette differences.")
+		return nil
+	}
+
+	fmt.Printf("Cassette differences: %d\n", len(report.Differences))
+	for _, difference := range report.Differences {
+		fmt.Printf("  %s %s: %s -> %s\n", difference.Location, difference.Field, difference.Before, difference.After)
+	}
+	return errCassetteDifferences
 }
