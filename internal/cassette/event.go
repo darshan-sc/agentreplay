@@ -1,6 +1,9 @@
 package cassette
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+)
 
 const SchemaVersion = "0.1"
 
@@ -33,13 +36,15 @@ type Event struct {
 }
 
 func decodeEvent(line []byte, lineNumber int) (Event, error) {
-	var raw map[string]any
-	if err := json.Unmarshal(line, &raw); err != nil {
+	var event Event
+	if err := json.Unmarshal(line, &event); err != nil {
 		return Event{}, err
 	}
 
-	var event Event
-	if err := json.Unmarshal(line, &event); err != nil {
+	var raw map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(line))
+	decoder.UseNumber()
+	if err := decoder.Decode(&raw); err != nil {
 		return Event{}, err
 	}
 	event.Raw = raw
