@@ -103,6 +103,120 @@ func TestValidateFileRejectsEventsAfterTraceEnd(t *testing.T) {
 	assertContains(t, issueMessages(report), "events cannot appear after trace.end")
 }
 
+func TestValidateFileAcceptsMatchedSpanRelationships(t *testing.T) {
+	path := writeTempCassette(t, strings.Join([]string{
+		`{"schema_version":"0.1","event":"trace.start","trace_id":"tr_test","name":"unit"}`,
+		`{"schema_version":"0.1","event":"llm.call","span_id":"sp_llm","provider":"openai","model":"gpt-4.1-mini","input_hash":"sha256:abc"}`,
+		`{"schema_version":"0.1","event":"llm.response","span_id":"sp_llm","output":{"text":"ok"}}`,
+		`{"schema_version":"0.1","event":"tool.call","span_id":"sp_tool","name":"search"}`,
+		`{"schema_version":"0.1","event":"tool.response","span_id":"sp_tool","output":{"result":"ok"}}`,
+		`{"schema_version":"0.1","event":"retrieval.call","span_id":"sp_retrieval","query":"agent replay"}`,
+		`{"schema_version":"0.1","event":"retrieval.response","span_id":"sp_retrieval","documents":[]}`,
+		`{"schema_version":"0.1","event":"trace.end","trace_id":"tr_test","status":"success"}`,
+	}, "\n"))
+
+	report, err := ValidateFile(path)
+	if err != nil {
+		t.Fatalf("ValidateFile returned error: %v", err)
+	}
+	if !report.Valid() {
+		t.Fatalf("expected valid report, got issues: %#v", report.Issues)
+	}
+}
+
+func TestValidateFileRejectsResponseBeforeCall(t *testing.T) {
+	path := writeTempCassette(t, strings.Join([]string{
+		`{"schema_version":"0.1","event":"trace.start","trace_id":"tr_test","name":"unit"}`,
+		`{"schema_version":"0.1","event":"llm.response","span_id":"sp_early","output":{"text":"too soon"}}`,
+		`{"schema_version":"0.1","event":"llm.call","span_id":"sp_early","provider":"openai","model":"gpt-4.1-mini","input_hash":"sha256:abc"}`,
+		`{"schema_version":"0.1","event":"trace.end","trace_id":"tr_test","status":"success"}`,
+	}, "\n"))
+
+	report, err := ValidateFile(path)
+	if err != nil {
+		t.Fatalf("ValidateFile returned error: %v", err)
+	}
+	if report.Valid() {
+		t.Fatal("expected invalid report")
+	}
+
+	messages := issueMessages(report)
+	assertContains(t, messages, `llm.response span_id "sp_early" has no prior llm.call`)
+	assertContains(t, messages, `llm.call span_id "sp_early" is missing llm.response`)
+}
+
+func TestValidateFileRejectsOrphanResponse(t *testing.T) {
+	path := writeTempCassette(t, strings.Join([]string{
+		`{"schema_version":"0.1","event":"trace.start","trace_id":"tr_test","name":"unit"}`,
+		`{"schema_version":"0.1","event":"tool.response","span_id":"sp_orphan","output":{"result":"ok"}}`,
+		`{"schema_version":"0.1","event":"trace.end","trace_id":"tr_test","status":"success"}`,
+	}, "\n"))
+
+	report, err := ValidateFile(path)
+	if err != nil {
+		t.Fatalf("ValidateFile returned error: %v", err)
+	}
+	if report.Valid() {
+		t.Fatal("expected invalid report")
+	}
+	assertContains(t, issueMessages(report), `tool.response span_id "sp_orphan" has no prior tool.call`)
+}
+
+func TestValidateFileRejectsDuplicateActiveCallSpan(t *testing.T) {
+	path := writeTempCassette(t, strings.Join([]string{
+		`{"schema_version":"0.1","event":"trace.start","trace_id":"tr_test","name":"unit"}`,
+		`{"schema_version":"0.1","event":"retrieval.call","span_id":"sp_dup","query":"first"}`,
+		`{"schema_version":"0.1","event":"retrieval.call","span_id":"sp_dup","query":"second"}`,
+		`{"schema_version":"0.1","event":"retrieval.response","span_id":"sp_dup","documents":[]}`,
+		`{"schema_version":"0.1","event":"trace.end","trace_id":"tr_test","status":"success"}`,
+	}, "\n"))
+
+	report, err := ValidateFile(path)
+	if err != nil {
+		t.Fatalf("ValidateFile returned error: %v", err)
+	}
+	if report.Valid() {
+		t.Fatal("expected invalid report")
+	}
+	assertContains(t, issueMessages(report), `retrieval.call span_id "sp_dup" is already active`)
+}
+
+func TestValidateFileRejectsDuplicateActiveCallSpanAcrossKinds(t *testing.T) {
+	path := writeTempCassette(t, strings.Join([]string{
+		`{"schema_version":"0.1","event":"trace.start","trace_id":"tr_test","name":"unit"}`,
+		`{"schema_version":"0.1","event":"llm.call","span_id":"sp_shared","provider":"openai","model":"gpt-4.1-mini","input_hash":"sha256:abc"}`,
+		`{"schema_version":"0.1","event":"tool.call","span_id":"sp_shared","name":"search"}`,
+		`{"schema_version":"0.1","event":"llm.response","span_id":"sp_shared","output":{"text":"ok"}}`,
+		`{"schema_version":"0.1","event":"trace.end","trace_id":"tr_test","status":"success"}`,
+	}, "\n"))
+
+	report, err := ValidateFile(path)
+	if err != nil {
+		t.Fatalf("ValidateFile returned error: %v", err)
+	}
+	if report.Valid() {
+		t.Fatal("expected invalid report")
+	}
+	assertContains(t, issueMessages(report), `tool.call span_id "sp_shared" is already active as llm.call`)
+}
+
+func TestValidateFileRejectsMissingResponse(t *testing.T) {
+	path := writeTempCassette(t, strings.Join([]string{
+		`{"schema_version":"0.1","event":"trace.start","trace_id":"tr_test","name":"unit"}`,
+		`{"schema_version":"0.1","event":"llm.call","span_id":"sp_missing","provider":"openai","model":"gpt-4.1-mini","input_hash":"sha256:abc"}`,
+		`{"schema_version":"0.1","event":"trace.end","trace_id":"tr_test","status":"success"}`,
+	}, "\n"))
+
+	report, err := ValidateFile(path)
+	if err != nil {
+		t.Fatalf("ValidateFile returned error: %v", err)
+	}
+	if report.Valid() {
+		t.Fatal("expected invalid report")
+	}
+	assertContains(t, issueMessages(report), `llm.call span_id "sp_missing" is missing llm.response`)
+}
+
 func writeTempCassette(t *testing.T, body string) string {
 	t.Helper()
 

@@ -134,6 +134,11 @@ func TestWriterRejectsInvalidEnvelope(t *testing.T) {
 			event:  map[string]any{"event": "unknown"},
 			errMsg: "unknown event type",
 		},
+		{
+			name:   "missing event-specific fields",
+			event:  map[string]any{"event": "trace.start"},
+			errMsg: "invalid trace.start event: missing trace_id",
+		},
 	}
 
 	for _, tt := range tests {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 )
 
 type Writer struct {
@@ -65,5 +66,28 @@ func prepareEvent(fields map[string]any) (map[string]any, error) {
 		return nil, fmt.Errorf("unknown event type %q", text)
 	}
 
+	if err := validatePreparedEvent(event, text); err != nil {
+		return nil, err
+	}
+
 	return event, nil
+}
+
+func validatePreparedEvent(fields map[string]any, eventType string) error {
+	report := Report{}
+	validateEventShape(&report, Event{
+		SchemaVersion: SchemaVersion,
+		EventType:     eventType,
+		Raw:           fields,
+		Line:          1,
+	})
+	if report.Valid() {
+		return nil
+	}
+
+	messages := make([]string, 0, len(report.Issues))
+	for _, issue := range report.Issues {
+		messages = append(messages, issue.Message)
+	}
+	return fmt.Errorf("invalid %s event: %s", eventType, strings.Join(messages, "; "))
 }

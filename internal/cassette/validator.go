@@ -42,6 +42,7 @@ func ValidateFile(path string) (Report, error) {
 	nonEmptyLine := 0
 	sawTraceStart := false
 	sawTraceEnd := false
+	spans := newSpanRelationships()
 
 	for scanner.Scan() {
 		lineNumber++
@@ -62,6 +63,9 @@ func ValidateFile(path string) (Report, error) {
 		report.Counts[event.EventType]++
 
 		validateEventShape(&report, event)
+		if !sawTraceEnd {
+			spans.observe(&report, event)
+		}
 
 		if event.EventType == "trace.start" {
 			if nonEmptyLine != 1 {
@@ -95,6 +99,7 @@ func ValidateFile(path string) (Report, error) {
 	if report.EventCount > 0 && !sawTraceEnd {
 		report.add(lineNumber, "cassette must end with trace.end")
 	}
+	spans.finish(&report)
 
 	return report, nil
 }
@@ -214,4 +219,79 @@ func validateAlternativeField(field string, value any) string {
 
 func (r *Report) add(line int, message string) {
 	r.Issues = append(r.Issues, Issue{Line: line, Message: message})
+}
+
+type spanRelationships struct {
+	active map[string]map[string]int
+}
+
+func newSpanRelationships() spanRelationships {
+	return spanRelationships{
+		active: map[string]map[string]int{
+			"llm":       {},
+			"tool":      {},
+			"retrieval": {},
+		},
+	}
+}
+
+func (s spanRelationships) observe(report *Report, event Event) {
+	switch event.EventType {
+	case "llm.call":
+		s.open(report, "llm", event)
+	case "tool.call":
+		s.open(report, "tool", event)
+	case "retrieval.call":
+		s.open(report, "retrieval", event)
+	case "llm.response":
+		s.close(report, "llm", event)
+	case "tool.response":
+		s.close(report, "tool", event)
+	case "retrieval.response":
+		s.close(report, "retrieval", event)
+	}
+}
+
+func (s spanRelationships) open(report *Report, kind string, event Event) {
+	if event.SpanID == "" {
+		return
+	}
+	if activeKind, line, ok := s.findActive(event.SpanID); ok {
+		if activeKind == kind {
+			report.add(event.Line, fmt.Sprintf("%s.call span_id %q is already active from line %d", kind, event.SpanID, line))
+		} else {
+			report.add(event.Line, fmt.Sprintf("%s.call span_id %q is already active as %s.call from line %d", kind, event.SpanID, activeKind, line))
+		}
+		return
+	}
+	s.active[kind][event.SpanID] = event.Line
+}
+
+func (s spanRelationships) close(report *Report, kind string, event Event) {
+	if event.SpanID == "" {
+		return
+	}
+	active := s.active[kind]
+	if _, ok := active[event.SpanID]; !ok {
+		report.add(event.Line, fmt.Sprintf("%s.response span_id %q has no prior %s.call", kind, event.SpanID, kind))
+		return
+	}
+	delete(active, event.SpanID)
+}
+
+func (s spanRelationships) finish(report *Report) {
+	for _, kind := range []string{"llm", "tool", "retrieval"} {
+		for spanID, line := range s.active[kind] {
+			report.add(line, fmt.Sprintf("%s.call span_id %q is missing %s.response", kind, spanID, kind))
+		}
+	}
+}
+
+func (s spanRelationships) findActive(spanID string) (string, int, bool) {
+	for _, kind := range []string{"llm", "tool", "retrieval"} {
+		if line, ok := s.active[kind][spanID]; ok {
+			return kind, line, true
+		}
+	}
+	return "", 0, false
 }
