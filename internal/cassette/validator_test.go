@@ -124,6 +124,23 @@ func TestValidateFileAcceptsMatchedSpanRelationships(t *testing.T) {
 	}
 }
 
+func TestValidateFileAcceptsErroredLLMResponse(t *testing.T) {
+	path := writeTempCassette(t, strings.Join([]string{
+		`{"schema_version":"0.1","event":"trace.start","trace_id":"tr_test","name":"unit"}`,
+		`{"schema_version":"0.1","event":"llm.call","span_id":"sp_llm","provider":"openai","model":"gpt-4.1-mini","input_hash":"sha256:abc"}`,
+		`{"schema_version":"0.1","event":"llm.response","span_id":"sp_llm","error":"RuntimeError: boom"}`,
+		`{"schema_version":"0.1","event":"trace.end","trace_id":"tr_test","status":"error"}`,
+	}, "\n"))
+
+	report, err := ValidateFile(path)
+	if err != nil {
+		t.Fatalf("ValidateFile returned error: %v", err)
+	}
+	if !report.Valid() {
+		t.Fatalf("expected valid report, got issues: %#v", report.Issues)
+	}
+}
+
 func TestValidateFileRejectsResponseBeforeCall(t *testing.T) {
 	path := writeTempCassette(t, strings.Join([]string{
 		`{"schema_version":"0.1","event":"trace.start","trace_id":"tr_test","name":"unit"}`,

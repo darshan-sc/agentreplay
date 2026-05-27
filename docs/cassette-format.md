@@ -50,6 +50,7 @@ The validator enforces:
 - Required fields exist for each event type.
 - Events do not appear after `trace.end`.
 - LLM, tool, and retrieval response events have a prior matching call event.
+- `llm.response` may contain either output data, an output hash, or an error string.
 - LLM, tool, and retrieval call events receive a matching response.
 - Active spans cannot be reused across event kinds.
 

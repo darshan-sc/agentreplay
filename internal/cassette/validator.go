@@ -131,7 +131,7 @@ func validateEventShape(report *Report, event Event) {
 		requireString(report, event, "input_hash")
 	case "llm.response":
 		requireString(report, event, "span_id")
-		requireAnyUsable(report, event, "output", "output_hash")
+		requireAnyUsable(report, event, "output", "output_hash", "error")
 	case "tool.call":
 		requireString(report, event, "span_id")
 		requireString(report, event, "name")
