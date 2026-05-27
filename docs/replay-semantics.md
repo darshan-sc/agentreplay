@@ -17,6 +17,13 @@ with replaying_openai("traces/run.replay.jsonl"):
 
 This patches the OpenAI Responses API inside the context and never falls back to a live API call.
 
+The CLI wrapper sets these environment variables for child processes:
+
+- `AGENTREPLAY_MODE=record` or `AGENTREPLAY_MODE=replay`
+- `AGENTREPLAY_CASSETTE=<cassette path>`
+- `AGENTREPLAY_RECORD_OUT=<cassette path>` during record
+- `AGENTREPLAY_REPLAY_PATH=<cassette path>` during replay
+
 ## Divergence
 
 Replay must fail loudly when:

@@ -6,7 +6,7 @@ AgentReplay records an agent run into a portable `.replay.jsonl` cassette, repla
 
 ## Status
 
-This repo has the first cassette layer, three CLI commands, and narrow Python OpenAI record/replay hooks wired. It can read, write, validate, inspect, diff, and hash `.replay.jsonl` cassettes, record non-streaming `client.responses.create(...)` calls, replay those calls offline, and match recorded LLM exchanges in process. The `record`/`replay` CLI flow, pytest generation, and LangGraph demo are planned next.
+This repo has the first cassette layer, five CLI commands, and narrow Python OpenAI record/replay hooks wired. It can read, write, validate, inspect, diff, and hash `.replay.jsonl` cassettes, record non-streaming `client.responses.create(...)` calls, replay those calls offline, and wrap Python workflows with `agentreplay record` / `agentreplay replay`. Pytest generation and the LangGraph demo are planned next.
 
 ## Quickstart
 
@@ -37,6 +37,8 @@ OK: traces/sample.replay.jsonl (4 events)
 - `agentreplay validate`
 - `agentreplay inspect`
 - `agentreplay diff`
+- `agentreplay record`
+- `agentreplay replay`
 - Versioned JSONL cassette reader and writer
 - Cassette validator with trace/span consistency checks
 - Deterministic JSON hash helpers
@@ -47,10 +49,22 @@ OK: traces/sample.replay.jsonl (4 events)
 
 ## Not Implemented Yet
 
-- `agentreplay record`.
-- `agentreplay replay` runtime flow.
 - Pytest generation.
 - LangGraph demo code.
+
+## OpenAI Smoke Workflow
+
+With `OPENAI_API_KEY` in `.env.local`, record one live call:
+
+```bash
+go run ./cmd/agentreplay record --out tmp/openai-smoke.replay.jsonl -- python3 python/examples/openai_record_smoke.py
+```
+
+Replay the same call offline:
+
+```bash
+go run ./cmd/agentreplay replay tmp/openai-smoke.replay.jsonl -- python3 python/examples/openai_record_smoke.py
+```
 
 ## Not in v0.1
 
