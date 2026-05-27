@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import importlib
+import json
 import math
 import os
 import re
@@ -12,13 +13,14 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
-from .cassette_writer import CassetteWriter
-from .hashing import hash_value
+from .cassette_writer import ALLOWED_EVENTS, SCHEMA_VERSION, CassetteWriter
+from .hashing import canonical_json, hash_value
 
 _OMIT = object()
-_ACTIVE_RECORDER = None
+_ACTIVE_CONTEXT = None
 
 _PARAM_FIELDS = {
     "frequency_penalty",
@@ -41,7 +43,6 @@ _TRANSPORT_FIELDS = {
     "base_url",
     "client",
     "default_headers",
-    "extra_body",
     "extra_headers",
     "extra_query",
     "headers",
@@ -81,6 +82,14 @@ class OpenAIHookError(RuntimeError):
     pass
 
 
+class OpenAIReplayError(OpenAIHookError):
+    pass
+
+
+class OpenAIReplayDivergenceError(OpenAIReplayError):
+    pass
+
+
 def recording_openai(
     path: str | os.PathLike[str],
     *,
@@ -95,6 +104,16 @@ def recording_openai(
     """
 
     return OpenAIRecorder(path, name=name, metadata=metadata, patch_target=patch_target)
+
+
+def replaying_openai(
+    path: str | os.PathLike[str],
+    *,
+    patch_target: tuple[type, str] | None = None,
+) -> "OpenAIReplayer":
+    """Replay non-streaming OpenAI Responses API calls from a cassette."""
+
+    return OpenAIReplayer(path, patch_target=patch_target)
 
 
 class OpenAIRecorder:
@@ -120,11 +139,11 @@ class OpenAIRecorder:
         self._trace_ended = False
 
     def __enter__(self) -> "OpenAIRecorder":
-        global _ACTIVE_RECORDER
+        global _ACTIVE_CONTEXT
 
-        if _ACTIVE_RECORDER is not None:
-            raise OpenAIHookError("recording_openai contexts cannot be nested")
-        _ACTIVE_RECORDER = self
+        if _ACTIVE_CONTEXT is not None:
+            raise OpenAIHookError("OpenAI recording/replay contexts cannot be nested")
+        _ACTIVE_CONTEXT = self
 
         try:
             self._writer = CassetteWriter(self.path).open()
@@ -141,11 +160,11 @@ class OpenAIRecorder:
         except Exception:
             self._restore_patch()
             self._close_writer()
-            _ACTIVE_RECORDER = None
+            _ACTIVE_CONTEXT = None
             raise
 
     def __exit__(self, exc_type, exc, tb) -> bool:
-        global _ACTIVE_RECORDER
+        global _ACTIVE_CONTEXT
 
         close_error = None
         try:
@@ -159,7 +178,7 @@ class OpenAIRecorder:
                 self._close_writer()
             except Exception as err:
                 close_error = close_error or err
-            _ACTIVE_RECORDER = None
+            _ACTIVE_CONTEXT = None
 
         if close_error is not None and exc_type is None:
             raise close_error
@@ -279,6 +298,326 @@ class OpenAIRecorder:
             writer = self._writer
             self._writer = None
             writer.close()
+
+
+class OpenAIReplayer:
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        patch_target: tuple[type, str] | None,
+    ) -> None:
+        self.path = Path(path)
+        self.patch_target = patch_target
+        self._target_owner: type | None = None
+        self._target_method: str | None = None
+        self._original_create = None
+        self._index: ReplayIndex | None = None
+
+    def __enter__(self) -> "OpenAIReplayer":
+        global _ACTIVE_CONTEXT
+
+        if _ACTIVE_CONTEXT is not None:
+            raise OpenAIHookError("OpenAI recording/replay contexts cannot be nested")
+        _ACTIVE_CONTEXT = self
+
+        try:
+            self._index = ReplayIndex.from_path(self.path)
+            self._patch_openai()
+            return self
+        except Exception:
+            self._restore_patch()
+            _ACTIVE_CONTEXT = None
+            raise
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        global _ACTIVE_CONTEXT
+
+        exit_error = None
+        try:
+            if exc_type is None and self._index is not None:
+                self._index.assert_exhausted()
+        except Exception as err:
+            exit_error = err
+        finally:
+            self._restore_patch()
+            _ACTIVE_CONTEXT = None
+
+        if exit_error is not None:
+            raise exit_error
+        return False
+
+    def _patch_openai(self) -> None:
+        owner, method = self.patch_target or _resolve_openai_create_target()
+        original = getattr(owner, method)
+
+        @functools.wraps(original)
+        def wrapper(*args, **kwargs):
+            return self._replay_create(*args, **kwargs)
+
+        setattr(owner, method, wrapper)
+        self._target_owner = owner
+        self._target_method = method
+        self._original_create = original
+
+    def _restore_patch(self) -> None:
+        if (
+            self._target_owner is not None
+            and self._target_method is not None
+            and self._original_create is not None
+        ):
+            setattr(self._target_owner, self._target_method, self._original_create)
+        self._target_owner = None
+        self._target_method = None
+        self._original_create = None
+
+    def _replay_create(self, *args, **kwargs) -> "RecordedOpenAIResponse":
+        if self._index is None:
+            raise OpenAIReplayError("replaying_openai is not active")
+
+        model = _extract_model(args, kwargs)
+        request = LLMReplayRequest(
+            provider="openai",
+            model=model,
+            input_hash=hash_value(_request_hash_payload(args, kwargs, model)),
+            params=_request_params(kwargs),
+        )
+        exchange = self._index.match_llm(request)
+        return RecordedOpenAIResponse(exchange.call, exchange.response)
+
+
+class LLMReplayRequest:
+    def __init__(self, *, provider: str, model: str, input_hash: str, params: dict[str, Any]) -> None:
+        self.provider = provider
+        self.model = model
+        self.input_hash = input_hash
+        self.params = params
+
+
+class LLMReplayExchange:
+    def __init__(self, call: Mapping[str, Any], response: Mapping[str, Any]) -> None:
+        self.call = call
+        self.response = response
+
+
+class LLMReplayState:
+    def __init__(self, call: Mapping[str, Any]) -> None:
+        self.call = call
+        self.response: Mapping[str, Any] | None = None
+
+
+class ReplayIndex:
+    def __init__(self, exchanges: list[LLMReplayExchange]) -> None:
+        self._exchanges = exchanges
+        self._next_llm = 0
+
+    @classmethod
+    def from_path(cls, path: Path) -> "ReplayIndex":
+        events = _read_cassette_events(path)
+        _validate_replay_cassette_events(path, events)
+        return cls(_build_llm_exchanges(events))
+
+    def match_llm(self, request: LLMReplayRequest) -> LLMReplayExchange:
+        if self._next_llm >= len(self._exchanges):
+            raise OpenAIReplayDivergenceError("replay exhausted: no recorded llm exchange remains")
+
+        exchange = self._exchanges[self._next_llm]
+        _match_llm_request(self._next_llm + 1, exchange.call, request)
+        _validate_recorded_response(self._next_llm + 1, exchange.response)
+        self._next_llm += 1
+        return exchange
+
+    def assert_exhausted(self) -> None:
+        remaining = len(self._exchanges) - self._next_llm
+        if remaining > 0:
+            raise OpenAIReplayDivergenceError(
+                f"replay incomplete: {remaining} recorded llm exchange(s) were not consumed"
+            )
+
+
+class RecordedOpenAIResponse:
+    """Small response shim returned by replaying_openai."""
+
+    def __init__(self, call: Mapping[str, Any], response: Mapping[str, Any]) -> None:
+        self.call = dict(call)
+        self.event = dict(response)
+        self.model = call.get("model")
+        self.output = response.get("output")
+        self.output_text = _output_text_from_recorded(self.output)
+        self.usage = _usage_namespace(response.get("usage"))
+
+    def model_dump(self, *args, **kwargs) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "output": self.output,
+            "output_text": self.output_text,
+        }
+        if self.usage is not None:
+            payload["usage"] = vars(self.usage)
+        return payload
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.model_dump()
+
+
+def _read_cassette_events(path: Path) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise OpenAIReplayError(f"read cassette {path}: {exc}") from exc
+
+    for line_number, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line:
+            raise OpenAIReplayError(f"{path}:{line_number}: blank lines are not valid cassette events")
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise OpenAIReplayError(f"{path}:{line_number}: invalid JSON event: {exc}") from exc
+        if not isinstance(event, dict):
+            raise OpenAIReplayError(f"{path}:{line_number}: cassette event must be an object")
+        event["_line"] = line_number
+        events.append(event)
+    return events
+
+
+def _validate_replay_cassette_events(path: Path, events: list[dict[str, Any]]) -> None:
+    if not events:
+        raise OpenAIReplayError(f"{path}: cassette must contain at least one event")
+
+    saw_trace_start = False
+    saw_trace_end = False
+
+    for index, event in enumerate(events):
+        line = event.get("_line")
+        schema_version = event.get("schema_version")
+        if schema_version != SCHEMA_VERSION:
+            raise OpenAIReplayError(f"{path}:{line}: unsupported schema_version {schema_version!r}")
+
+        event_type = event.get("event")
+        if not isinstance(event_type, str) or not event_type:
+            raise OpenAIReplayError(f"{path}:{line}: event must be a non-empty string")
+        if event_type not in ALLOWED_EVENTS:
+            raise OpenAIReplayError(f"{path}:{line}: unknown event type {event_type!r}")
+
+        if index == 0 and event_type != "trace.start":
+            raise OpenAIReplayError(f"{path}:{line}: cassette must start with trace.start")
+        if event_type == "trace.start":
+            if saw_trace_start:
+                raise OpenAIReplayError(f"{path}:{line}: cassette contains more than one trace.start event")
+            saw_trace_start = True
+        if saw_trace_end:
+            raise OpenAIReplayError(f"{path}:{line}: events cannot appear after trace.end")
+        if event_type == "trace.end":
+            saw_trace_end = True
+
+    if not saw_trace_end:
+        raise OpenAIReplayError(f"{path}: cassette must end with trace.end")
+
+
+def _build_llm_exchanges(events: list[dict[str, Any]]) -> list[LLMReplayExchange]:
+    states: list[LLMReplayState] = []
+    active: dict[str, int] = {}
+
+    for event in events:
+        event_type = event.get("event")
+        if event_type == "llm.call":
+            span_id = event.get("span_id")
+            if not isinstance(span_id, str) or not span_id:
+                raise OpenAIReplayError(f"llm.call at line {event.get('_line')} is missing span_id")
+            if span_id in active:
+                first_line = states[active[span_id]].call.get("_line")
+                raise OpenAIReplayError(
+                    f'llm.call span_id "{span_id}" at line {event.get("_line")} is already active from line {first_line}'
+                )
+            active[span_id] = len(states)
+            states.append(LLMReplayState(event))
+        elif event_type == "llm.response":
+            span_id = event.get("span_id")
+            if not isinstance(span_id, str) or not span_id:
+                raise OpenAIReplayError(f"llm.response at line {event.get('_line')} is missing span_id")
+            if span_id not in active:
+                raise OpenAIReplayError(
+                    f'llm.response span_id "{span_id}" at line {event.get("_line")} has no prior llm.call'
+                )
+            states[active[span_id]].response = event
+            del active[span_id]
+
+    if active:
+        span_id, state_index = next(iter(active.items()))
+        call = states[state_index].call
+        raise OpenAIReplayError(
+            f'llm.call span_id "{span_id}" at line {call.get("_line")} is missing llm.response'
+        )
+
+    exchanges: list[LLMReplayExchange] = []
+    for state in states:
+        if state.response is None:
+            raise OpenAIReplayError(
+                f'llm.call span_id "{state.call.get("span_id")}" at line {state.call.get("_line")} is missing llm.response'
+            )
+        exchanges.append(LLMReplayExchange(call=state.call, response=state.response))
+    return exchanges
+
+
+def _match_llm_request(index: int, call: Mapping[str, Any], request: LLMReplayRequest) -> None:
+    recorded_provider = call.get("provider")
+    if recorded_provider != request.provider:
+        raise OpenAIReplayDivergenceError(
+            f'llm replay mismatch at exchange {index}: provider mismatch: recorded {recorded_provider!r}, got {request.provider!r}'
+        )
+
+    recorded_model = call.get("model")
+    if recorded_model != request.model:
+        raise OpenAIReplayDivergenceError(
+            f'llm replay mismatch at exchange {index}: model mismatch: recorded {recorded_model!r}, got {request.model!r}'
+        )
+
+    recorded_input_hash = call.get("input_hash")
+    if recorded_input_hash != request.input_hash:
+        raise OpenAIReplayDivergenceError(
+            f'llm replay mismatch at exchange {index}: input_hash mismatch: recorded {recorded_input_hash!r}, got {request.input_hash!r}'
+        )
+
+    recorded_params = call.get("params", {})
+    if recorded_params != request.params:
+        raise OpenAIReplayDivergenceError(
+            "llm replay mismatch at exchange "
+            f"{index}: params mismatch: recorded {_describe_params(recorded_params)}, got {_describe_params(request.params)}"
+        )
+
+
+def _validate_recorded_response(index: int, response: Mapping[str, Any]) -> None:
+    if "error" in response:
+        raise OpenAIReplayError(f"recorded llm response at exchange {index} contains error: {response['error']}")
+    if "output" not in response:
+        raise OpenAIReplayError(f"recorded llm response at exchange {index} is missing replayable output")
+    if response["output"] is None:
+        raise OpenAIReplayError(f"recorded llm response at exchange {index} has null output")
+
+
+def _describe_params(value: Any) -> str:
+    try:
+        return canonical_json(value)
+    except ValueError:
+        return repr(value)
+
+
+def _output_text_from_recorded(output: Any) -> str | None:
+    if isinstance(output, Mapping):
+        text = output.get("text")
+        if isinstance(text, str):
+            return text
+    if isinstance(output, str):
+        return output
+    return None
+
+
+def _usage_namespace(value: Any) -> SimpleNamespace | None:
+    if not isinstance(value, Mapping):
+        return None
+    return SimpleNamespace(**{str(key): item for key, item in value.items()})
 
 
 def _resolve_openai_create_target() -> tuple[type, str]:

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
+
+repo_root = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(repo_root / "python"))
 
 from openai import OpenAI
 
@@ -9,7 +13,6 @@ from agentreplay.openai_hook import recording_openai
 
 
 def main() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
     load_env_file(repo_root / ".env.local")
 
     cassette_path = repo_root / "tmp" / "openai-smoke.replay.jsonl"

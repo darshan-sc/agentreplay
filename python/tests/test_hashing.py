@@ -33,6 +33,12 @@ class HashingTests(unittest.TestCase):
             "sha256:6ff041b4ca8d25b6faa00b8232ae5fe99ca780996c8c99e22e8ec46084a7a030",
         )
 
+    def test_hash_value_matches_go_html_escaped_fixture(self) -> None:
+        self.assertEqual(
+            hash_value({"text": "<tag>&\u2028\u2029"}),
+            "sha256:c47f39dffe7e1e6261dbd6a73aa7af45527ab7ba06eba4a9cce8dc662f4f655b",
+        )
+
     def test_hash_rejects_non_json_values(self) -> None:
         with self.assertRaises(ValueError):
             hash_value({"bad": object()})

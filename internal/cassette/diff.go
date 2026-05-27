@@ -143,6 +143,7 @@ func compareLLMExchanges(report *DiffReport, beforeEvents []Event, afterEvents [
 
 		responseLocation := fmt.Sprintf("llm exchange %d response", i+1)
 		compareField(report, responseLocation, "output_hash", beforeExchange.Response.Raw, afterExchange.Response.Raw)
+		compareField(report, responseLocation, "error", beforeExchange.Response.Raw, afterExchange.Response.Raw)
 		compareResponseOutput(report, responseLocation, beforeExchange.Response, afterExchange.Response)
 	}
 
@@ -275,6 +276,9 @@ func fieldString(event Event, field string) string {
 }
 
 func responseSummary(response Event) string {
+	if err, ok := response.Raw["error"].(string); ok && err != "" {
+		return "error=" + strconv.Quote(err)
+	}
 	if outputHash, ok := response.Raw["output_hash"].(string); ok && outputHash != "" {
 		return outputHash
 	}
