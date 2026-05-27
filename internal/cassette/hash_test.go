@@ -60,6 +60,20 @@ func TestHashValueCanonicalizesNestedMaps(t *testing.T) {
 	}
 }
 
+func TestHashValueMatchesEscapedJSONFixture(t *testing.T) {
+	hash, err := HashValue(map[string]any{
+		"text": "<tag>&\u2028\u2029",
+	})
+	if err != nil {
+		t.Fatalf("HashValue returned error: %v", err)
+	}
+
+	const expected = "sha256:c47f39dffe7e1e6261dbd6a73aa7af45527ab7ba06eba4a9cce8dc662f4f655b"
+	if hash != expected {
+		t.Fatalf("expected escaped JSON fixture hash %q, got %q", expected, hash)
+	}
+}
+
 func TestHashJSONRejectsInvalidJSON(t *testing.T) {
 	_, err := HashJSON([]byte(`{"a":`))
 	if err == nil {

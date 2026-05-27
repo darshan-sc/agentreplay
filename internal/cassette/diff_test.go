@@ -64,6 +64,30 @@ func TestDiffEventsReportsAddedLLMExchange(t *testing.T) {
 	assertContains(t, messages, "<missing> -> provider=openai model=gpt-4.1-mini input_hash=sha256:second response=sha256:second-output")
 }
 
+func TestDiffEventsReportsLLMErrorChanges(t *testing.T) {
+	before := readValidCassetteEvents(t,
+		`{"schema_version":"0.1","event":"trace.start","trace_id":"tr_diff_before","name":"unit"}`,
+		`{"schema_version":"0.1","event":"llm.call","trace_id":"tr_diff_before","span_id":"sp_1","provider":"openai","model":"gpt-4.1-mini","input_hash":"sha256:input","params":{"temperature":0}}`,
+		`{"schema_version":"0.1","event":"llm.response","trace_id":"tr_diff_before","span_id":"sp_1","error":"RateLimitError: before"}`,
+		`{"schema_version":"0.1","event":"trace.end","trace_id":"tr_diff_before","status":"error"}`,
+	)
+	after := readValidCassetteEvents(t,
+		`{"schema_version":"0.1","event":"trace.start","trace_id":"tr_diff_after","name":"unit"}`,
+		`{"schema_version":"0.1","event":"llm.call","trace_id":"tr_diff_after","span_id":"sp_1","provider":"openai","model":"gpt-4.1-mini","input_hash":"sha256:input","params":{"temperature":0}}`,
+		`{"schema_version":"0.1","event":"llm.response","trace_id":"tr_diff_after","span_id":"sp_1","error":"RateLimitError: after"}`,
+		`{"schema_version":"0.1","event":"trace.end","trace_id":"tr_diff_after","status":"error"}`,
+	)
+
+	report, err := DiffEvents(before, after)
+	if err != nil {
+		t.Fatalf("DiffEvents returned error: %v", err)
+	}
+
+	messages := diffMessages(report)
+	assertContains(t, messages, "llm exchange 1 response error")
+	assertContains(t, messages, `"RateLimitError: before" -> "RateLimitError: after"`)
+}
+
 func TestDiffEventsReportsRemovedLLMExchange(t *testing.T) {
 	before := readValidCassetteEvents(t,
 		`{"schema_version":"0.1","event":"trace.start","trace_id":"tr_diff_before","name":"unit"}`,

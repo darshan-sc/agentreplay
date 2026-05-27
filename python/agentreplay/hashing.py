@@ -8,18 +8,27 @@ from typing import Any
 
 HASH_PREFIX = "sha256:"
 
+_GO_JSON_ESCAPES = {
+    ord("<"): "\\u003c",
+    ord(">"): "\\u003e",
+    ord("&"): "\\u0026",
+    ord("\u2028"): "\\u2028",
+    ord("\u2029"): "\\u2029",
+}
+
 
 def canonical_json(value: Any) -> str:
     """Return compact, key-sorted JSON for a JSON-serializable value."""
 
     try:
-        return json.dumps(
+        encoded = json.dumps(
             value,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
             allow_nan=False,
         )
+        return encoded.translate(_GO_JSON_ESCAPES)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"canonicalize JSON for hash: {exc}") from exc
 

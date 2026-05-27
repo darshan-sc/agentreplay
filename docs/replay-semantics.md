@@ -6,11 +6,23 @@ Replay should freeze a previous agent run and make divergence obvious.
 
 When replaying, AgentReplay should match each live request attempt against the cassette. If the normalized provider, model, params, and input hash match, it returns the recorded response.
 
+The first Python runtime API is:
+
+```python
+from agentreplay.openai_hook import replaying_openai
+
+with replaying_openai("traces/run.replay.jsonl"):
+    response = client.responses.create(...)
+```
+
+This patches the OpenAI Responses API inside the context and never falls back to a live API call.
+
 ## Divergence
 
 Replay must fail loudly when:
 
 - The workflow asks for an LLM call that is not present in the cassette.
+- The workflow exits successfully before consuming every recorded LLM call.
 - The call order changes.
 - The normalized input hash changes.
 - A recorded response is missing or malformed.

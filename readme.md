@@ -6,7 +6,7 @@ AgentReplay records an agent run into a portable `.replay.jsonl` cassette, repla
 
 ## Status
 
-This repo has the first cassette layer, three CLI commands, and a narrow Python OpenAI recording hook wired. It can read, write, validate, inspect, diff, and hash `.replay.jsonl` cassettes, record non-streaming `client.responses.create(...)` calls, and match recorded LLM exchanges in process. Offline runtime replay, the `record`/`replay` CLI flow, and pytest generation are planned next.
+This repo has the first cassette layer, three CLI commands, and narrow Python OpenAI record/replay hooks wired. It can read, write, validate, inspect, diff, and hash `.replay.jsonl` cassettes, record non-streaming `client.responses.create(...)` calls, replay those calls offline, and match recorded LLM exchanges in process. The `record`/`replay` CLI flow, pytest generation, and LangGraph demo are planned next.
 
 ## Quickstart
 
@@ -42,6 +42,7 @@ OK: traces/sample.replay.jsonl (4 events)
 - Deterministic JSON hash helpers
 - In-process LLM replay index and request matching
 - Python OpenAI non-streaming recording hook for `client.responses.create(...)`
+- Python OpenAI offline replay hook for `client.responses.create(...)`
 - Synthetic sample cassette
 
 ## Not Implemented Yet
