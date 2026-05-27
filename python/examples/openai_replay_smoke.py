@@ -16,7 +16,7 @@ from openai_record_smoke import load_env_file
 def main() -> None:
     load_env_file(repo_root / ".env.local")
 
-    cassette_path = repo_root / "tmp" / "openai-smoke.replay.jsonl"
+    cassette_path = Path(os.getenv("AGENTREPLAY_CASSETTE", str(repo_root / "tmp" / "openai-smoke.replay.jsonl")))
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", "agentreplay-offline"))
 
     with replaying_openai(cassette_path):
