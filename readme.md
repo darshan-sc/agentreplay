@@ -25,7 +25,8 @@ No silent live fallback. No guessing what changed. Just a readable timeline of w
 - Writes versioned JSONL cassettes that are easy to inspect and diff.
 - Validates cassette structure, event order, spans, and trace consistency.
 - Diffs two cassettes to expose replay-relevant changes.
-- Provides a Go CLI for `record`, `replay`, `validate`, `inspect`, and `diff`.
+- Generates pytest regression files from one or more cassettes.
+- Provides a Go CLI for `record`, `replay`, `validate`, `inspect`, `diff`, and `generate-tests`.
 - Provides Python context managers for direct OpenAI record/replay hooks.
 
 ## Quickstart
@@ -39,6 +40,7 @@ python3 -m unittest discover -s python/tests
 go run ./cmd/agentreplay validate traces/sample.replay.jsonl
 go run ./cmd/agentreplay inspect traces/sample.replay.jsonl
 go run ./cmd/agentreplay diff traces/sample.replay.jsonl traces/sample.replay.jsonl
+go run ./cmd/agentreplay generate-tests traces/sample.replay.jsonl --framework pytest --out tmp/test_agent_replays.py
 ```
 
 Expected validation output:
@@ -68,6 +70,16 @@ go run ./cmd/agentreplay replay tmp/openai-smoke.replay.jsonl -- python3 python/
 ```
 
 During replay, AgentReplay patches the OpenAI Responses API inside the process and returns the recorded response from the cassette. If the code asks for a different request, changes order, or cannot match the recorded call, replay fails instead of calling the live API.
+
+## Generate pytest regression tests
+
+Generate a pytest file from one or more cassettes:
+
+```bash
+go run ./cmd/agentreplay generate-tests traces/sample.replay.jsonl --framework pytest --out tests/test_agent_replays.py
+```
+
+The generated tests call `agentreplay.pytest.replay_case(...)`, which loads each cassette and checks that its recorded LLM exchanges are usable for offline replay. With `pytest` installed, run the generated file like any other pytest test module.
 
 ## Python API
 
@@ -107,6 +119,7 @@ Usage:
   agentreplay record --out <cassette.replay.jsonl> -- <command> [args...]
   agentreplay replay <cassette.replay.jsonl> -- <command> [args...]
   agentreplay diff <before.replay.jsonl> <after.replay.jsonl>
+  agentreplay generate-tests <cassette...> --framework pytest --out <file>
 ```
 
 The CLI passes these environment variables to the child process:
@@ -138,16 +151,17 @@ Implemented:
 - `agentreplay diff`
 - `agentreplay record`
 - `agentreplay replay`
+- `agentreplay generate-tests`
 - Versioned JSONL cassette reader and writer
 - Cassette validator with trace/span consistency checks
 - Deterministic JSON hash helpers
 - In-process LLM replay index and request matching
 - Python OpenAI non-streaming recording and replay hooks
+- Pytest regression test generation
 - Synthetic sample cassette
 
 Planned next:
 
-- Pytest regression test generation
 - LangGraph demo agent
 - Broader adapter support
 - Streaming replay

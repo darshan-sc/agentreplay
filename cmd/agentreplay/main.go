@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -52,7 +53,7 @@ func run(args []string) error {
 	case "replay":
 		return runReplay(args[1:])
 	case "generate-tests":
-		return fmt.Errorf("%q is planned but is not implemented in this slice", args[0])
+		return runGenerateTests(args[1:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return nil
@@ -258,6 +259,126 @@ func runDiff(args []string) error {
 		fmt.Printf("  %s %s: %s -> %s\n", difference.Location, difference.Field, difference.Before, difference.After)
 	}
 	return errCassetteDifferences
+}
+
+func runGenerateTests(args []string) error {
+	cassettePaths, framework, outPath, err := parseGenerateTestsArgs(args)
+	if err != nil {
+		return err
+	}
+	if framework == "" || outPath == "" || len(cassettePaths) == 0 {
+		return errors.New("usage: agentreplay generate-tests <cassette...> --framework pytest --out <file>")
+	}
+	if framework != "pytest" {
+		return fmt.Errorf("unsupported test framework %q: only pytest is supported", framework)
+	}
+	if err := rejectOutputCassetteCollision(outPath, cassettePaths); err != nil {
+		return err
+	}
+
+	body, err := cassette.GeneratePytestTests(cassette.PytestGenerationOptions{
+		CassettePaths: cassettePaths,
+		OutputPath:    outPath,
+	})
+	if err != nil {
+		return err
+	}
+	if err := writeGeneratedFile(outPath, body); err != nil {
+		return err
+	}
+
+	fmt.Printf("Generated pytest tests: %s (%d cassette(s))\n", outPath, len(cassettePaths))
+	return nil
+}
+
+func rejectOutputCassetteCollision(outPath string, cassettePaths []string) error {
+	resolvedOut, err := comparablePath(outPath)
+	if err != nil {
+		return fmt.Errorf("resolve output path %q: %w", outPath, err)
+	}
+
+	for _, cassettePath := range cassettePaths {
+		resolvedCassette, err := comparablePath(cassettePath)
+		if err != nil {
+			return fmt.Errorf("resolve cassette path %q: %w", cassettePath, err)
+		}
+		if resolvedOut == resolvedCassette {
+			return fmt.Errorf("refusing to overwrite input cassette %q with generated tests", cassettePath)
+		}
+	}
+	return nil
+}
+
+func comparablePath(path string) (string, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	absPath = filepath.Clean(absPath)
+
+	resolved, err := filepath.EvalSymlinks(absPath)
+	if err == nil {
+		return filepath.Clean(resolved), nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+
+	parent := filepath.Dir(absPath)
+	resolvedParent, parentErr := filepath.EvalSymlinks(parent)
+	if parentErr != nil {
+		if os.IsNotExist(parentErr) {
+			return absPath, nil
+		}
+		return "", parentErr
+	}
+	return filepath.Clean(filepath.Join(resolvedParent, filepath.Base(absPath))), nil
+}
+
+func parseGenerateTestsArgs(args []string) ([]string, string, string, error) {
+	var cassettePaths []string
+	var framework string
+	var outPath string
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--framework":
+			if i+1 >= len(args) {
+				return nil, "", "", errors.New("missing value for --framework")
+			}
+			i++
+			framework = args[i]
+		case strings.HasPrefix(arg, "--framework="):
+			framework = strings.TrimPrefix(arg, "--framework=")
+		case arg == "--out":
+			if i+1 >= len(args) {
+				return nil, "", "", errors.New("missing value for --out")
+			}
+			i++
+			outPath = args[i]
+		case strings.HasPrefix(arg, "--out="):
+			outPath = strings.TrimPrefix(arg, "--out=")
+		case strings.HasPrefix(arg, "-"):
+			return nil, "", "", fmt.Errorf("unknown generate-tests flag %q", arg)
+		default:
+			cassettePaths = append(cassettePaths, arg)
+		}
+	}
+
+	return cassettePaths, framework, outPath, nil
+}
+
+func writeGeneratedFile(path string, body []byte) error {
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create output directory %q: %w", dir, err)
+		}
+	}
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		return fmt.Errorf("write generated tests %q: %w", path, err)
+	}
+	return nil
 }
 
 func splitCommandArgs(args []string) ([]string, []string, error) {
