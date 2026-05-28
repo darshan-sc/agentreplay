@@ -422,6 +422,7 @@ class ReplayIndex:
             raise OpenAIReplayDivergenceError("replay exhausted: no recorded llm exchange remains")
 
         exchange = self._exchanges[self._next_llm]
+        _validate_recorded_call(self._next_llm + 1, exchange.call)
         _match_llm_request(self._next_llm + 1, exchange.call, request)
         _validate_recorded_response(self._next_llm + 1, exchange.response)
         self._next_llm += 1
@@ -433,6 +434,15 @@ class ReplayIndex:
             raise OpenAIReplayDivergenceError(
                 f"replay incomplete: {remaining} recorded llm exchange(s) were not consumed"
             )
+
+    @property
+    def llm_exchange_count(self) -> int:
+        return len(self._exchanges)
+
+    def assert_replayable(self) -> None:
+        for index, exchange in enumerate(self._exchanges, start=1):
+            _validate_recorded_call(index, exchange.call)
+            _validate_recorded_response(index, exchange.response)
 
 
 class RecordedOpenAIResponse:
@@ -585,6 +595,20 @@ def _match_llm_request(index: int, call: Mapping[str, Any], request: LLMReplayRe
         raise OpenAIReplayDivergenceError(
             "llm replay mismatch at exchange "
             f"{index}: params mismatch: recorded {_describe_params(recorded_params)}, got {_describe_params(request.params)}"
+        )
+
+
+def _validate_recorded_call(index: int, call: Mapping[str, Any]) -> None:
+    for field in ("provider", "model", "input_hash"):
+        value = call.get(field)
+        if not isinstance(value, str) or not value:
+            raise OpenAIReplayError(
+                f"recorded llm call at exchange {index} is missing replayable {field}"
+            )
+
+    if "params" in call and not isinstance(call["params"], Mapping):
+        raise OpenAIReplayError(
+            f"recorded llm call at exchange {index} has non-object params"
         )
 
 
