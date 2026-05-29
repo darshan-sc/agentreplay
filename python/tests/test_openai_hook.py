@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -13,7 +14,9 @@ from agentreplay.hashing import hash_value
 from agentreplay.openai_hook import (
     OpenAIReplayDivergenceError,
     OpenAIReplayError,
+    record_agent_step,
     recording_openai,
+    recording_tool,
     replaying_openai,
 )
 
@@ -44,6 +47,11 @@ class FailingResponses:
 class OfflineResponses:
     def create(self, **kwargs):
         raise AssertionError("live OpenAI method should not be called during replay")
+
+
+class SecretRepr:
+    def __repr__(self) -> str:
+        return "SecretRepr(sk-reprsecret123456)"
 
 
 class OpenAIHookTests(unittest.TestCase):
@@ -332,6 +340,175 @@ class OpenAIHookTests(unittest.TestCase):
             with self.assertRaisesRegex(OpenAIReplayError, "unsupported schema_version"):
                 with replaying_openai(cassette, patch_target=(OfflineResponses, "create")):
                     pass
+
+    def test_agent_and_tool_payloads_redact_secret_like_strings(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            cassette = Path(tempdir) / "payload-redaction.replay.jsonl"
+
+            with recording_openai(
+                cassette,
+                name="payload-redaction",
+                patch_target=(FakeResponses, "create"),
+            ):
+                record_agent_step(
+                    "prepare",
+                    input={
+                        "note": "Bearer secret-token.123",
+                        "url": "postgres://user:pass@db/app",
+                        "env": "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                        "access_key_id": "AKIAIOSFODNN7EXAMPLE",
+                        "AWS_SECRET_ACCESS_KEY": "drop-secret-key",
+                        "apiKey": "drop-api-key",
+                        "accessKey": "drop-access-key",
+                        "privateKey": "drop-private-key",
+                        "pwd": "drop-pwd",
+                        "passwd": "drop-passwd",
+                        "sessionToken": "drop-session-token",
+                        "csrfToken": "drop-csrf-token",
+                        "max_output_tokens": 16,
+                        "session_cookie": "sid=abc123; HttpOnly",
+                        "cookies": "sid=def456; Secure",
+                        "set-cookie": "sid=ghi789; HttpOnly",
+                        "body": "-----BEGIN OPENSSH PRIVATE KEY-----\nabc123\n-----END OPENSSH PRIVATE KEY-----",
+                        "json_payload": '{"password":"hunter2","api_key":"plain-secret","safe":"ok"}',
+                        "nested": ["prefix sk-agentsecret123456"],
+                        "sk-agentkeysecret123456": "drop-key",
+                        "safe": {
+                            "Bearer nested-key-token.123": "drop-nested-key",
+                            "ok": "keep",
+                        },
+                    },
+                    output={"safe": "ok"},
+                )
+                with recording_tool(
+                    "lookup",
+                    input={"note": "Bearer tool-token.123"},
+                    metadata={
+                        "description": "uses sk-metasecret123456",
+                        "sk-metakeysecret123456": "drop-key",
+                    },
+                ) as tool:
+                    tool.set_output({
+                        "msg": "sk-toolsecret123456",
+                        "sk-outputkeysecret123456": "drop-key",
+                    })
+
+            events = _read_events(cassette)
+            self.assertEqual(events[1]["input"]["note"], "[REDACTED]")
+            self.assertEqual(events[1]["input"]["url"], "[REDACTED]")
+            self.assertEqual(events[1]["input"]["env"], "[REDACTED]")
+            self.assertNotIn("access_key_id", events[1]["input"])
+            self.assertNotIn("AWS_SECRET_ACCESS_KEY", events[1]["input"])
+            self.assertNotIn("apiKey", events[1]["input"])
+            self.assertNotIn("accessKey", events[1]["input"])
+            self.assertNotIn("privateKey", events[1]["input"])
+            self.assertNotIn("pwd", events[1]["input"])
+            self.assertNotIn("passwd", events[1]["input"])
+            self.assertNotIn("sessionToken", events[1]["input"])
+            self.assertNotIn("csrfToken", events[1]["input"])
+            self.assertEqual(events[1]["input"]["max_output_tokens"], 16)
+            self.assertNotIn("session_cookie", events[1]["input"])
+            self.assertNotIn("cookies", events[1]["input"])
+            self.assertNotIn("set-cookie", events[1]["input"])
+            self.assertEqual(events[1]["input"]["body"], "[REDACTED]")
+            self.assertNotIn("hunter2", events[1]["input"]["json_payload"])
+            self.assertNotIn("plain-secret", events[1]["input"]["json_payload"])
+            self.assertIn('"safe":"ok"', events[1]["input"]["json_payload"])
+            self.assertEqual(events[1]["input"]["nested"], ["prefix [REDACTED]"])
+            self.assertNotIn("sk-agentkeysecret123456", events[1]["input"])
+            self.assertNotIn("Bearer nested-key-token.123", events[1]["input"]["safe"])
+            self.assertEqual(events[1]["input"]["safe"]["ok"], "keep")
+            self.assertEqual(events[2]["input"]["note"], "[REDACTED]")
+            self.assertEqual(events[2]["metadata"]["description"], "uses [REDACTED]")
+            self.assertNotIn("sk-metakeysecret123456", events[2]["metadata"])
+            self.assertEqual(events[3]["output"], {"msg": "[REDACTED]"})
+            self.assertEqual(events[3]["output_hash"], hash_value({"msg": "[REDACTED]"}))
+
+            raw = cassette.read_text(encoding="utf-8")
+            self.assertNotIn("secret-token", raw)
+            self.assertNotIn("postgres://", raw)
+            self.assertNotIn("user:pass", raw)
+            self.assertNotIn("AWS_SECRET_ACCESS_KEY", raw)
+            self.assertNotIn("wJalrXUtn", raw)
+            self.assertNotIn("AKIAIOSFODNN7EXAMPLE", raw)
+            self.assertNotIn("drop-api-key", raw)
+            self.assertNotIn("drop-access-key", raw)
+            self.assertNotIn("drop-private-key", raw)
+            self.assertNotIn("drop-pwd", raw)
+            self.assertNotIn("drop-passwd", raw)
+            self.assertNotIn("drop-session-token", raw)
+            self.assertNotIn("drop-csrf-token", raw)
+            self.assertNotIn("sid=abc123", raw)
+            self.assertNotIn("sid=def456", raw)
+            self.assertNotIn("sid=ghi789", raw)
+            self.assertNotIn("OPENSSH PRIVATE KEY", raw)
+            self.assertNotIn("hunter2", raw)
+            self.assertNotIn("plain-secret", raw)
+            self.assertNotIn("sk-agentsecret", raw)
+            self.assertNotIn("sk-agentkeysecret", raw)
+            self.assertNotIn("nested-key-token", raw)
+            self.assertNotIn("tool-token", raw)
+            self.assertNotIn("sk-metasecret", raw)
+            self.assertNotIn("sk-metakeysecret", raw)
+            self.assertNotIn("sk-toolsecret", raw)
+            self.assertNotIn("sk-outputkeysecret", raw)
+
+            _validate_with_go(cassette)
+
+    def test_tool_none_output_records_validator_compatible_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            cassette = Path(tempdir) / "none-tool-output.replay.jsonl"
+
+            with recording_openai(
+                cassette,
+                name="none-tool-output",
+                patch_target=(FakeResponses, "create"),
+            ):
+                with recording_tool("maybe_none", input={"id": "tool-1"}) as tool:
+                    tool.set_output(None)
+
+            events = _read_events(cassette)
+            self.assertEqual(
+                [event["event"] for event in events],
+                ["trace.start", "tool.call", "tool.response", "trace.end"],
+            )
+            self.assertEqual(events[2]["output"], {"value": None})
+            self.assertEqual(events[2]["output_hash"], hash_value({"value": None}))
+
+            _validate_with_go(cassette)
+
+    def test_tool_unsupported_outputs_record_safe_marker(self) -> None:
+        marker = {
+            "value_unavailable": True,
+            "reason": "unsupported_type",
+        }
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            cassette = Path(tempdir) / "unsupported-tool-output.replay.jsonl"
+
+            with recording_openai(
+                cassette,
+                name="unsupported-tool-output",
+                patch_target=(FakeResponses, "create"),
+            ):
+                with recording_tool("path_output") as tool:
+                    tool.set_output(Path("/tmp/sk-pathsecret123456"))
+                with recording_tool("decimal_output") as tool:
+                    tool.set_output(Decimal("12.3"))
+                with recording_tool("object_output") as tool:
+                    tool.set_output(SecretRepr())
+
+            events = _read_events(cassette)
+            self.assertEqual(events[2]["output"], marker)
+            self.assertEqual(events[2]["output_hash"], hash_value(marker))
+            self.assertEqual(events[4]["output"], marker)
+            self.assertEqual(events[6]["output"], marker)
+
+            raw = cassette.read_text(encoding="utf-8")
+            self.assertNotIn("sk-pathsecret", raw)
+            self.assertNotIn("sk-reprsecret", raw)
+
+            _validate_with_go(cassette)
 
     def test_failed_responses_create_records_error_and_restores_patch(self) -> None:
         original = FailingResponses.create

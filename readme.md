@@ -26,6 +26,7 @@ No silent live fallback. No guessing what changed. Just a readable timeline of w
 - Validates cassette structure, event order, spans, and trace consistency.
 - Diffs two cassettes to expose replay-relevant changes.
 - Generates pytest regression files from one or more cassettes.
+- Records Python agent step and tool span events alongside LLM calls.
 - Provides a Go CLI for `record`, `replay`, `validate`, `inspect`, `diff`, and `generate-tests`.
 - Provides Python context managers for direct OpenAI record/replay hooks.
 
@@ -71,6 +72,22 @@ go run ./cmd/agentreplay replay tmp/openai-smoke.replay.jsonl -- python3 python/
 
 During replay, AgentReplay patches the OpenAI Responses API inside the process and returns the recorded response from the cassette. If the code asks for a different request, changes order, or cannot match the recorded call, replay fails instead of calling the live API.
 
+## Run the LangGraph-style demo
+
+Record a small tool-plus-LLM agent run:
+
+```bash
+go run ./cmd/agentreplay record --out tmp/langgraph-demo.replay.jsonl -- python3 python/examples/langgraph_demo.py
+```
+
+Replay it offline:
+
+```bash
+go run ./cmd/agentreplay replay tmp/langgraph-demo.replay.jsonl -- python3 python/examples/langgraph_demo.py
+```
+
+The demo uses LangGraph's `StateGraph` when LangGraph is installed, and otherwise runs the same two-node flow locally. The cassette includes `agent.step`, `tool.call`, `tool.response`, `llm.call`, and `llm.response` events.
+
 ## Generate pytest regression tests
 
 Generate a pytest file from one or more cassettes:
@@ -106,6 +123,17 @@ with replaying_openai("traces/run.replay.jsonl"):
         temperature=0,
         max_output_tokens=16,
     )
+```
+
+Record agent and tool events in the same cassette:
+
+```python
+from agentreplay import record_agent_step, recording_openai, recording_tool
+
+with recording_openai("traces/run.replay.jsonl", name="agent"):
+    record_agent_step("lookup", input={"query": "refund policy"})
+    with recording_tool("search_docs", input={"query": "refund policy"}) as tool:
+        tool.set_output({"result": "Refunds require the original order number."})
 ```
 
 ## CLI
@@ -157,12 +185,13 @@ Implemented:
 - Deterministic JSON hash helpers
 - In-process LLM replay index and request matching
 - Python OpenAI non-streaming recording and replay hooks
+- Python agent step and tool span recording helpers
 - Pytest regression test generation
+- LangGraph-style demo agent
 - Synthetic sample cassette
 
 Planned next:
 
-- LangGraph demo agent
 - Broader adapter support
 - Streaming replay
 
@@ -177,4 +206,5 @@ Not in v0.1:
 
 - [Cassette format](docs/cassette-format.md)
 - [Replay semantics](docs/replay-semantics.md)
+- [Payload privacy](docs/payload-privacy.md)
 - [Architecture](docs/architecture.md)
