@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentreplay"
+version = "0.1.0"
+description = "Deterministic replay helpers for LLM agents."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "AgentReplay contributors" },
+]
+dependencies = [
+  "openai>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+langgraph = [
+  "langgraph>=0.2.0",
+]
+all = [
+  "pytest>=8.0.0",
+  "langgraph>=0.2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agentreplay*"]

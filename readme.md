@@ -23,6 +23,7 @@ No silent live fallback. No guessing what changed. Just a readable timeline of w
 - Records non-streaming OpenAI `client.responses.create(...)` calls from Python.
 - Replays recorded OpenAI responses offline.
 - Writes versioned JSONL cassettes that are easy to inspect and diff.
+- Sanitizes cassette payloads before writing and hashes sanitized payloads.
 - Validates cassette structure, event order, spans, and trace consistency.
 - Diffs two cassettes to expose replay-relevant changes.
 - Generates pytest regression files from one or more cassettes.
@@ -30,18 +31,50 @@ No silent live fallback. No guessing what changed. Just a readable timeline of w
 - Provides a Go CLI for `record`, `replay`, `validate`, `inspect`, `diff`, and `generate-tests`.
 - Provides Python context managers for direct OpenAI record/replay hooks.
 
+## Install
+
+Requirements:
+
+- Go 1.20 or newer
+- Python 3.11 or newer
+
+Set up a local development environment:
+
+```bash
+make setup
+```
+
+This creates `.venv`, installs the Python package in editable mode, and installs the development test dependency for generated pytest files.
+
+If you want the LangGraph demo to use real LangGraph instead of the built-in local fallback, run:
+
+```bash
+make setup-all
+```
+
+To use the Python package from another project:
+
+```bash
+python3 -m pip install -e ./python
+```
+
+Build a local CLI binary:
+
+```bash
+make build-cli
+bin/agentreplay validate traces/sample.replay.jsonl
+```
+
 ## Quickstart
 
 Run the test suite and inspect the sample cassette:
 
 ```bash
-go test ./...
-python3 -m unittest discover -s python/tests
+make test
 
-go run ./cmd/agentreplay validate traces/sample.replay.jsonl
-go run ./cmd/agentreplay inspect traces/sample.replay.jsonl
-go run ./cmd/agentreplay diff traces/sample.replay.jsonl traces/sample.replay.jsonl
-go run ./cmd/agentreplay generate-tests traces/sample.replay.jsonl --framework pytest --out tmp/test_agent_replays.py
+make validate-sample
+make inspect-sample
+make generate-sample-tests
 ```
 
 Expected validation output:
@@ -52,22 +85,23 @@ OK: traces/sample.replay.jsonl (4 events)
 
 ## Record and replay an OpenAI call
 
-Put your OpenAI key in `.env.local`:
+Put your OpenAI key in `.env.local`. You can start from `.env.example`:
 
 ```bash
+cp .env.example .env.local
 OPENAI_API_KEY=...
 ```
 
 Record one live call:
 
 ```bash
-go run ./cmd/agentreplay record --out tmp/openai-smoke.replay.jsonl -- python3 python/examples/openai_record_smoke.py
+make smoke-record
 ```
 
 Replay the same workflow offline:
 
 ```bash
-go run ./cmd/agentreplay replay tmp/openai-smoke.replay.jsonl -- python3 python/examples/openai_record_smoke.py
+make smoke-replay
 ```
 
 During replay, AgentReplay patches the OpenAI Responses API inside the process and returns the recorded response from the cassette. If the code asks for a different request, changes order, or cannot match the recorded call, replay fails instead of calling the live API.
@@ -77,13 +111,13 @@ During replay, AgentReplay patches the OpenAI Responses API inside the process a
 Record a small tool-plus-LLM agent run:
 
 ```bash
-go run ./cmd/agentreplay record --out tmp/langgraph-demo.replay.jsonl -- python3 python/examples/langgraph_demo.py
+make langgraph-record
 ```
 
 Replay it offline:
 
 ```bash
-go run ./cmd/agentreplay replay tmp/langgraph-demo.replay.jsonl -- python3 python/examples/langgraph_demo.py
+make langgraph-replay
 ```
 
 The demo uses LangGraph's `StateGraph` when LangGraph is installed, and otherwise runs the same two-node flow locally. The cassette includes `agent.step`, `tool.call`, `tool.response`, `llm.call`, and `llm.response` events.
@@ -97,6 +131,12 @@ go run ./cmd/agentreplay generate-tests traces/sample.replay.jsonl --framework p
 ```
 
 The generated tests call `agentreplay.pytest.replay_case(...)`, which loads each cassette and checks that its recorded LLM exchanges are usable for offline replay. With `pytest` installed, run the generated file like any other pytest test module.
+
+After `make setup`, you can also run:
+
+```bash
+make test-pytest
+```
 
 ## Python API
 
@@ -135,6 +175,26 @@ with recording_openai("traces/run.replay.jsonl", name="agent"):
     with recording_tool("search_docs", input={"query": "refund policy"}) as tool:
         tool.set_output({"result": "Refunds require the original order number."})
 ```
+
+## Payload privacy
+
+The default recorder privacy mode is `safe`: AgentReplay recursively drops common secret-bearing keys, redacts common secret-like strings, writes the sanitized payload, and recalculates hashes from the sanitized payload.
+
+For highly sensitive prompts or tool outputs, use `hide_all`:
+
+```python
+with recording_openai("traces/private.replay.jsonl", privacy="hide_all"):
+    ...
+```
+
+For domain-specific private data, use `transform` with your own sanitizer:
+
+```python
+with recording_openai("traces/run.replay.jsonl", privacy="transform", sanitizer=my_sanitizer):
+    ...
+```
+
+See [Payload privacy](docs/payload-privacy.md) for the exact behavior and tradeoffs.
 
 ## CLI
 
@@ -186,6 +246,7 @@ Implemented:
 - In-process LLM replay index and request matching
 - Python OpenAI non-streaming recording and replay hooks
 - Python agent step and tool span recording helpers
+- Payload privacy modes: `safe`, `hide_all`, and `transform`
 - Pytest regression test generation
 - LangGraph-style demo agent
 - Synthetic sample cassette
