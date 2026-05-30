@@ -18,6 +18,7 @@ from typing import Any
 
 from .cassette_writer import ALLOWED_EVENTS, SCHEMA_VERSION, CassetteWriter
 from .hashing import canonical_json, hash_value
+from .privacy import PrivacyMode, redact_text, sanitize_payload, should_drop_key, unsupported_payload_marker
 
 _OMIT = object()
 _ACTIVE_CONTEXT = None
@@ -59,20 +60,47 @@ _SENSITIVE_EXACT_KEYS = {
     "authorization",
     "bearer",
     "cookie",
+    "cookies",
     "credentials",
     "password",
+    "passwd",
+    "pwd",
     "refresh_token",
     "secret",
     "token",
 }
 
 _SENSITIVE_KEY_PARTS = (
+    "access_key",
+    "access_key_id",
     "api_key",
     "authorization",
+    "client_secret",
+    "cookie",
+    "csrf_token",
     "credential",
+    "id_token",
+    "password",
+    "private_key",
+    "secret_access_key",
+    "secret_key",
+    "session_token",
+    "secret",
 )
 
 _SECRET_PATTERNS = (
+    re.compile(
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+        re.DOTALL,
+    ),
+    re.compile(r"\b(?:set-cookie|cookie)\s*:\s*[^,\n]+", re.IGNORECASE),
+    re.compile(r"\b[^=\s;]+=[^;\s]+;\s*(?:HttpOnly|Secure|SameSite=[A-Za-z]+)", re.IGNORECASE),
+    re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s/@:]+:[^\s/@]+@[^\s]+", re.IGNORECASE),
+    re.compile(
+        r"(?<![A-Za-z0-9_])[\"']?(?:aws_secret_access_key|secret_access_key|access_key_secret|client_secret|api_key|api_token|token|password|passwd|pwd)[\"']?\s*[:=]\s*(?:[\"'][^\"']*[\"']|[^,\s;&}\]]+)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:AKIA|ASIA|AIDA|AROA|AGPA|AIPA|ANPA)[A-Z0-9]{16}\b"),
     re.compile(r"sk-[A-Za-z0-9_-]{8,}"),
     re.compile(r"Bearer\s+[A-Za-z0-9._-]+", re.IGNORECASE),
 )
@@ -95,6 +123,8 @@ def recording_openai(
     *,
     name: str = "openai",
     metadata: Mapping[str, Any] | None = None,
+    privacy: PrivacyMode = "safe",
+    sanitizer=None,
     patch_target: tuple[type, str] | None = None,
 ) -> "OpenAIRecorder":
     """Record non-streaming OpenAI Responses API calls into a cassette.
@@ -103,17 +133,52 @@ def recording_openai(
     experiments. Normal callers should rely on the default OpenAI SDK target.
     """
 
-    return OpenAIRecorder(path, name=name, metadata=metadata, patch_target=patch_target)
+    return OpenAIRecorder(
+        path,
+        name=name,
+        metadata=metadata,
+        privacy=privacy,
+        sanitizer=sanitizer,
+        patch_target=patch_target,
+    )
 
 
 def replaying_openai(
     path: str | os.PathLike[str],
     *,
+    privacy: PrivacyMode = "safe",
+    sanitizer=None,
     patch_target: tuple[type, str] | None = None,
 ) -> "OpenAIReplayer":
     """Replay non-streaming OpenAI Responses API calls from a cassette."""
 
-    return OpenAIReplayer(path, patch_target=patch_target)
+    return OpenAIReplayer(path, privacy=privacy, sanitizer=sanitizer, patch_target=patch_target)
+
+
+def record_agent_step(
+    name: str,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+    input: Any = _OMIT,
+    output: Any = _OMIT,
+) -> None:
+    """Record an agent.step event when an AgentReplay recorder is active."""
+
+    recorder = _active_recorder()
+    if recorder is None:
+        return
+    recorder._write_agent_step(name, metadata=metadata, input=input, output=output)
+
+
+def recording_tool(
+    name: str,
+    *,
+    input: Any = _OMIT,
+    metadata: Mapping[str, Any] | None = None,
+) -> "RecordedToolSpan":
+    """Record a tool.call/tool.response span when a recorder is active."""
+
+    return RecordedToolSpan(name, input=input, metadata=metadata)
 
 
 class OpenAIRecorder:
@@ -123,11 +188,15 @@ class OpenAIRecorder:
         *,
         name: str,
         metadata: Mapping[str, Any] | None,
+        privacy: PrivacyMode,
+        sanitizer,
         patch_target: tuple[type, str] | None,
     ) -> None:
         self.path = Path(path)
         self.name = name
         self.metadata = metadata or {}
+        self.privacy = privacy
+        self.sanitizer = sanitizer
         self.patch_target = patch_target
         self.trace_id = f"tr_{uuid.uuid4().hex}"
         self._span_counter = 0
@@ -146,7 +215,11 @@ class OpenAIRecorder:
         _ACTIVE_CONTEXT = self
 
         try:
-            self._writer = CassetteWriter(self.path).open()
+            self._writer = CassetteWriter(
+                self.path,
+                privacy=self.privacy,
+                sanitizer=self.sanitizer,
+            ).open()
             self._writer.write_event(
                 {
                     "event": "trace.start",
@@ -223,8 +296,8 @@ class OpenAIRecorder:
         span_id = self._next_span_id()
         model = _extract_model(args, kwargs)
         request_payload = _request_hash_payload(args, kwargs, model)
-        input_hash = hash_value(request_payload)
-        params = _request_params(kwargs)
+        input_hash = self._input_hash(request_payload)
+        params = self._sanitize_params(_request_params(kwargs))
 
         call_event: dict[str, Any] = {
             "event": "llm.call",
@@ -253,7 +326,7 @@ class OpenAIRecorder:
             )
             raise
 
-        output = _response_output(response)
+        output = sanitize_payload(_response_output(response))
         output_hash = hash_value(output)
         response_event: dict[str, Any] = {
             "event": "llm.response",
@@ -266,9 +339,68 @@ class OpenAIRecorder:
         usage = _response_usage(response)
         if usage:
             response_event["usage"] = usage
-        writer.write_event(response_event)
-        self._last_output_hash = output_hash
+        written_response = writer.write_event(response_event)
+        self._remember_output_hash(written_response)
         return response
+
+    def _write_agent_step(
+        self,
+        name: str,
+        *,
+        metadata: Mapping[str, Any] | None,
+        input: Any,
+        output: Any,
+    ) -> None:
+        event: dict[str, Any] = {
+            "event": "agent.step",
+            "trace_id": self.trace_id,
+            "name": name,
+        }
+        _add_jsonable_field(event, "metadata", metadata)
+        _add_jsonable_payload(event, "input", input)
+        _add_jsonable_payload(event, "output", output)
+        written_event = self._require_writer().write_event(event)
+        self._remember_output_hash(written_event)
+
+    def _write_tool_call(
+        self,
+        span_id: str,
+        name: str,
+        *,
+        input: Any,
+        metadata: Mapping[str, Any] | None,
+    ) -> None:
+        event: dict[str, Any] = {
+            "event": "tool.call",
+            "trace_id": self.trace_id,
+            "span_id": span_id,
+            "name": name,
+        }
+        _add_jsonable_field(event, "metadata", metadata)
+        _add_jsonable_payload(event, "input", input)
+        self._require_writer().write_event(event)
+
+    def _write_tool_response(
+        self,
+        span_id: str,
+        *,
+        output: Any = _OMIT,
+        error: str | None = None,
+        started: float | None = None,
+    ) -> None:
+        event: dict[str, Any] = {
+            "event": "tool.response",
+            "trace_id": self.trace_id,
+            "span_id": span_id,
+        }
+        if error is not None:
+            event["error"] = _redact_text(error)
+        else:
+            _add_jsonable_payload(event, "output", {} if output is _OMIT else output)
+        if started is not None:
+            event["latency_ms"] = _latency_ms(started)
+        written_event = self._require_writer().write_event(event)
+        self._remember_output_hash(written_event)
 
     def _write_trace_end(self, status: str) -> None:
         if self._trace_ended:
@@ -299,15 +431,33 @@ class OpenAIRecorder:
             self._writer = None
             writer.close()
 
+    def _remember_output_hash(self, event: Mapping[str, Any]) -> None:
+        output_hash = event.get("output_hash")
+        if isinstance(output_hash, str) and output_hash:
+            self._last_output_hash = output_hash
+
+    def _sanitize_hash_payload(self, payload: Any) -> Any:
+        return _sanitize_hash_payload(payload, privacy=self.privacy, sanitizer=self.sanitizer)
+
+    def _sanitize_params(self, params: dict[str, Any]) -> dict[str, Any]:
+        return _sanitize_params(params, privacy=self.privacy, sanitizer=self.sanitizer)
+
+    def _input_hash(self, payload: Any) -> str:
+        return _input_hash(payload, privacy=self.privacy, sanitizer=self.sanitizer)
+
 
 class OpenAIReplayer:
     def __init__(
         self,
         path: str | os.PathLike[str],
         *,
+        privacy: PrivacyMode,
+        sanitizer,
         patch_target: tuple[type, str] | None,
     ) -> None:
         self.path = Path(path)
+        self.privacy = privacy
+        self.sanitizer = sanitizer
         self.patch_target = patch_target
         self._target_owner: type | None = None
         self._target_method: str | None = None
@@ -379,11 +529,77 @@ class OpenAIReplayer:
         request = LLMReplayRequest(
             provider="openai",
             model=model,
-            input_hash=hash_value(_request_hash_payload(args, kwargs, model)),
-            params=_request_params(kwargs),
+            input_hash=_input_hash(
+                _request_hash_payload(args, kwargs, model),
+                privacy=self.privacy,
+                sanitizer=self.sanitizer,
+            ),
+            params=_sanitize_params(
+                _request_params(kwargs),
+                privacy=self.privacy,
+                sanitizer=self.sanitizer,
+            ),
         )
         exchange = self._index.match_llm(request)
         return RecordedOpenAIResponse(exchange.call, exchange.response)
+
+
+class RecordedToolSpan:
+    def __init__(
+        self,
+        name: str,
+        *,
+        input: Any,
+        metadata: Mapping[str, Any] | None,
+    ) -> None:
+        self.name = name
+        self.input = input
+        self.metadata = metadata
+        self.span_id: str | None = None
+        self._recorder: OpenAIRecorder | None = None
+        self._started: float | None = None
+        self._output: Any = _OMIT
+        self._closed = False
+
+    def __enter__(self) -> "RecordedToolSpan":
+        recorder = _active_recorder()
+        if recorder is None:
+            return self
+
+        self._recorder = recorder
+        self.span_id = recorder._next_span_id()
+        self._started = time.monotonic()
+        recorder._write_tool_call(
+            self.span_id,
+            self.name,
+            input=self.input,
+            metadata=self.metadata,
+        )
+        return self
+
+    def set_output(self, output: Any) -> None:
+        self._output = output
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self._closed or self._recorder is None or self.span_id is None:
+            return False
+
+        self._closed = True
+        if exc_type is not None:
+            message = f"{exc_type.__name__}: {exc}" if exc is not None else exc_type.__name__
+            self._recorder._write_tool_response(
+                self.span_id,
+                error=message,
+                started=self._started,
+            )
+            return False
+
+        self._recorder._write_tool_response(
+            self.span_id,
+            output=self._output,
+            started=self._started,
+        )
+        return False
 
 
 class LLMReplayRequest:
@@ -628,6 +844,97 @@ def _describe_params(value: Any) -> str:
         return repr(value)
 
 
+def _active_recorder() -> OpenAIRecorder | None:
+    if isinstance(_ACTIVE_CONTEXT, OpenAIRecorder):
+        return _ACTIVE_CONTEXT
+    return None
+
+
+def _add_jsonable_field(event: dict[str, Any], field: str, value: Any) -> None:
+    if value is _OMIT or value is None:
+        return
+    payload = _recorded_payload_value(value)
+    if payload is not _OMIT:
+        event[field] = payload
+
+
+def _add_jsonable_payload(event: dict[str, Any], field: str, value: Any) -> None:
+    if value is _OMIT:
+        return
+    payload = _normalize_recorded_payload(field, _recorded_payload_value(value))
+    event[field] = payload
+    event[f"{field}_hash"] = hash_value(payload)
+
+
+def _normalize_recorded_payload(field: str, value: Any) -> Any:
+    if value is None:
+        return {"value": None}
+    if field == "output" and value == "":
+        return {"value": ""}
+    return value
+
+
+def _recorded_payload_value(value: Any) -> Any:
+    if value is _OMIT:
+        return _OMIT
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return _redact_text(value)
+    if isinstance(value, bool) or isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else _unsupported_payload_marker()
+    if isinstance(value, Mapping):
+        return _recorded_payload_mapping(value)
+    if isinstance(value, (list, tuple)):
+        return [_recorded_payload_item(item) for item in value]
+    if is_dataclass(value) and not isinstance(value, type):
+        return _recorded_payload_value(asdict(value))
+
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return _recorded_payload_value(model_dump(mode="json", exclude_none=True))
+        except TypeError:
+            try:
+                return _recorded_payload_value(model_dump())
+            except Exception:
+                return _unsupported_payload_marker()
+        except Exception:
+            return _unsupported_payload_marker()
+
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return _recorded_payload_value(to_dict())
+        except Exception:
+            return _unsupported_payload_marker()
+
+    return _unsupported_payload_marker()
+
+
+def _recorded_payload_mapping(value: Mapping[Any, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        key_text = str(key)
+        if _drop_key(key_text) or _redact_text(key_text) != key_text:
+            continue
+        result[key_text] = _recorded_payload_item(item)
+    return result
+
+
+def _recorded_payload_item(value: Any) -> Any:
+    payload = _recorded_payload_value(value)
+    if payload is _OMIT:
+        return _unsupported_payload_marker()
+    return payload
+
+
+def _unsupported_payload_marker() -> dict[str, Any]:
+    return unsupported_payload_marker()
+
+
 def _output_text_from_recorded(output: Any) -> str | None:
     if isinstance(output, Mapping):
         text = output.get("text")
@@ -697,6 +1004,29 @@ def _request_params(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     return params
 
 
+def _sanitize_hash_payload(value: Any, *, privacy: PrivacyMode, sanitizer) -> Any:
+    if privacy == "transform":
+        if sanitizer is None:
+            raise ValueError("privacy mode 'transform' requires a sanitizer")
+        return sanitize_payload(sanitizer(value))
+    if privacy == "hide_all":
+        return {"value_hidden": True}
+    return sanitize_payload(value)
+
+
+def _input_hash(value: Any, *, privacy: PrivacyMode, sanitizer) -> str:
+    if privacy == "hide_all":
+        return "hidden:payload"
+    return hash_value(_sanitize_hash_payload(value, privacy=privacy, sanitizer=sanitizer))
+
+
+def _sanitize_params(params: dict[str, Any], *, privacy: PrivacyMode, sanitizer) -> dict[str, Any]:
+    if not params or privacy == "hide_all":
+        return {}
+    sanitized = _sanitize_hash_payload(params, privacy=privacy, sanitizer=sanitizer)
+    return sanitized if isinstance(sanitized, dict) else {}
+
+
 def _sanitize_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
     sanitized: dict[str, Any] = {}
     for key, item in value.items():
@@ -710,8 +1040,10 @@ def _sanitize_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _to_jsonable(value: Any) -> Any:
-    if value is None or isinstance(value, (str, bool, int)):
+    if value is None or isinstance(value, (bool, int)):
         return value
+    if isinstance(value, str):
+        return _redact_text(value)
     if isinstance(value, float):
         return value if math.isfinite(value) else _OMIT
     if isinstance(value, Mapping):
@@ -749,14 +1081,15 @@ def _to_jsonable(value: Any) -> Any:
 
 
 def _drop_key(key: str) -> bool:
-    normalized = key.lower().replace("-", "_")
-    if normalized in _TRANSPORT_FIELDS:
+    if should_drop_key(key):
         return True
-    if normalized in _SENSITIVE_EXACT_KEYS:
-        return True
-    if normalized.endswith(("_password", "_secret", "_token")):
-        return True
-    return any(part in normalized for part in _SENSITIVE_KEY_PARTS)
+    return _normalize_key(key) in _TRANSPORT_FIELDS
+
+
+def _normalize_key(key: str) -> str:
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key)
+    text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", text)
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
 
 
 def _response_output(response: Any) -> dict[str, Any]:
@@ -851,7 +1184,4 @@ def _latency_ms(started: float) -> int:
 
 
 def _redact_text(text: str) -> str:
-    redacted = text
-    for pattern in _SECRET_PATTERNS:
-        redacted = pattern.sub("[REDACTED]", redacted)
-    return redacted
+    return redact_text(text)

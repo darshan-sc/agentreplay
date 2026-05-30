@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
+
+from .hashing import hash_value
+from .privacy import PrivacyMode, sanitize_event
 
 SCHEMA_VERSION = "0.1"
 
@@ -26,8 +29,16 @@ ALLOWED_EVENTS = {
 class CassetteWriter:
     """Write compact, flushed JSONL cassette events with a stable schema."""
 
-    def __init__(self, path: str | os.PathLike[str]) -> None:
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        privacy: PrivacyMode = "safe",
+        sanitizer: Callable[[Any], Any] | None = None,
+    ) -> None:
         self.path = Path(path)
+        self.privacy = privacy
+        self.sanitizer = sanitizer
         self._file = None
 
     def __enter__(self) -> "CassetteWriter":
@@ -49,12 +60,13 @@ class CassetteWriter:
         self._file = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
         return self
 
-    def write_event(self, fields: Mapping[str, Any]) -> None:
+    def write_event(self, fields: Mapping[str, Any]) -> dict[str, Any]:
         if self._file is None:
             raise RuntimeError("cassette writer is not open")
 
-        event = dict(fields)
+        event = sanitize_event(fields, mode=self.privacy, sanitizer=self.sanitizer)
         event.setdefault("schema_version", SCHEMA_VERSION)
+        _refresh_hash_fields(event, privacy=self.privacy)
         _validate_event(event)
 
         json.dump(
@@ -67,6 +79,7 @@ class CassetteWriter:
         )
         self._file.write("\n")
         self._file.flush()
+        return event
 
     def close(self) -> None:
         if self._file is None:
@@ -117,6 +130,20 @@ def _validate_event(event: Mapping[str, Any]) -> None:
     elif event_type == "trace.end":
         _require_string(event, "trace_id")
         _require_string(event, "status")
+
+
+def _refresh_hash_fields(event: dict[str, Any], *, privacy: PrivacyMode) -> None:
+    if privacy == "hide_all":
+        for field in ("output_hash",):
+            event.pop(field, None)
+        return
+
+    if "input" in event:
+        event["input_hash"] = hash_value(event["input"])
+    if "output" in event:
+        event["output_hash"] = hash_value(event["output"])
+    if "documents" in event:
+        event["output_hash"] = hash_value(event["documents"])
 
 
 def _require_string(event: Mapping[str, Any], field: str) -> None:

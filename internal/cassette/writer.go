@@ -9,15 +9,26 @@ import (
 )
 
 type Writer struct {
-	buf *bufio.Writer
+	buf     *bufio.Writer
+	privacy PrivacyOptions
 }
 
 func NewWriter(w io.Writer) *Writer {
-	return &Writer{buf: bufio.NewWriter(w)}
+	return NewWriterWithPrivacy(w, PrivacyOptions{Mode: PrivacySafe})
+}
+
+func NewWriterWithPrivacy(w io.Writer, options PrivacyOptions) *Writer {
+	if options.Mode == "" {
+		options.Mode = PrivacySafe
+	}
+	return &Writer{
+		buf:     bufio.NewWriter(w),
+		privacy: options,
+	}
 }
 
 func (w *Writer) WriteEvent(fields map[string]any) error {
-	event, err := prepareEvent(fields)
+	event, err := prepareEvent(fields, w.privacy)
 	if err != nil {
 		return err
 	}
@@ -39,10 +50,10 @@ func (w *Writer) Flush() error {
 	return w.buf.Flush()
 }
 
-func prepareEvent(fields map[string]any) (map[string]any, error) {
-	event := make(map[string]any, len(fields)+1)
-	for key, value := range fields {
-		event[key] = value
+func prepareEvent(fields map[string]any, privacy PrivacyOptions) (map[string]any, error) {
+	event, err := sanitizeEvent(fields, privacy)
+	if err != nil {
+		return nil, err
 	}
 
 	if version, ok := event["schema_version"]; ok {
@@ -52,6 +63,9 @@ func prepareEvent(fields map[string]any) (map[string]any, error) {
 		}
 	} else {
 		event["schema_version"] = SchemaVersion
+	}
+	if err := refreshHashFields(event, privacy.Mode); err != nil {
+		return nil, err
 	}
 
 	eventType, ok := event["event"]
@@ -71,6 +85,36 @@ func prepareEvent(fields map[string]any) (map[string]any, error) {
 	}
 
 	return event, nil
+}
+
+func refreshHashFields(event map[string]any, mode PrivacyMode) error {
+	if mode == PrivacyHideAll {
+		delete(event, "output_hash")
+		return nil
+	}
+
+	if input, ok := event["input"]; ok {
+		hash, err := HashValue(input)
+		if err != nil {
+			return err
+		}
+		event["input_hash"] = hash
+	}
+	if output, ok := event["output"]; ok {
+		hash, err := HashValue(output)
+		if err != nil {
+			return err
+		}
+		event["output_hash"] = hash
+	}
+	if documents, ok := event["documents"]; ok {
+		hash, err := HashValue(documents)
+		if err != nil {
+			return err
+		}
+		event["output_hash"] = hash
+	}
+	return nil
 }
 
 func validatePreparedEvent(fields map[string]any, eventType string) error {
