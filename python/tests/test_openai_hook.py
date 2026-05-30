@@ -19,6 +19,7 @@ from agentreplay.openai_hook import (
     recording_tool,
     replaying_openai,
 )
+from agentreplay.cassette_writer import CassetteWriter
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -52,6 +53,17 @@ class OfflineResponses:
 class SecretRepr:
     def __repr__(self) -> str:
         return "SecretRepr(sk-reprsecret123456)"
+
+
+def mask_private_value(value):
+    if isinstance(value, dict):
+        return {
+            key: mask_private_value("[PRIVATE]" if item == "private-value" else item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [mask_private_value(item) for item in value]
+    return value
 
 
 class OpenAIHookTests(unittest.TestCase):
@@ -474,6 +486,7 @@ class OpenAIHookTests(unittest.TestCase):
             )
             self.assertEqual(events[2]["output"], {"value": None})
             self.assertEqual(events[2]["output_hash"], hash_value({"value": None}))
+            self.assertEqual(events[3]["output_hash"], events[2]["output_hash"])
 
             _validate_with_go(cassette)
 
@@ -503,12 +516,223 @@ class OpenAIHookTests(unittest.TestCase):
             self.assertEqual(events[2]["output_hash"], hash_value(marker))
             self.assertEqual(events[4]["output"], marker)
             self.assertEqual(events[6]["output"], marker)
+            self.assertEqual(events[7]["output_hash"], events[6]["output_hash"])
 
             raw = cassette.read_text(encoding="utf-8")
             self.assertNotIn("sk-pathsecret", raw)
             self.assertNotIn("sk-reprsecret", raw)
 
             _validate_with_go(cassette)
+
+    def test_llm_request_hash_uses_redacted_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            cassette = Path(tempdir) / "request-secret.replay.jsonl"
+            fake = FakeResponses()
+
+            with recording_openai(
+                cassette,
+                name="request-secret",
+                patch_target=(FakeResponses, "create"),
+            ):
+                fake.create(
+                    model="gpt-4.1-mini",
+                    input="use sk-inputsecret123456",
+                    temperature=0,
+                    max_output_tokens=16,
+                )
+
+            events = _read_events(cassette)
+            self.assertEqual(
+                events[1]["input_hash"],
+                hash_value(
+                    {
+                        "model": "gpt-4.1-mini",
+                        "input": "use [REDACTED]",
+                        "temperature": 0,
+                        "max_output_tokens": 16,
+                    }
+                ),
+            )
+            self.assertNotIn("sk-inputsecret", cassette.read_text(encoding="utf-8"))
+
+    def test_transform_privacy_sanitizes_llm_request_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            cassette = Path(tempdir) / "transform-request.replay.jsonl"
+            fake = FakeResponses()
+
+            with recording_openai(
+                cassette,
+                name="transform-request",
+                privacy="transform",
+                sanitizer=mask_private_value,
+                patch_target=(FakeResponses, "create"),
+            ):
+                fake.create(
+                    model="gpt-4.1-mini",
+                    input="private-value",
+                    metadata={"user": "private-value"},
+                    temperature=0,
+                    max_output_tokens=16,
+                )
+
+            events = _read_events(cassette)
+            self.assertEqual(
+                events[1]["input_hash"],
+                hash_value(
+                    {
+                        "model": "gpt-4.1-mini",
+                        "input": "[PRIVATE]",
+                        "metadata": {"user": "[PRIVATE]"},
+                        "temperature": 0,
+                        "max_output_tokens": 16,
+                    }
+                ),
+            )
+            self.assertEqual(
+                events[1]["params"],
+                {"max_output_tokens": 16, "metadata": {"user": "[PRIVATE]"}, "temperature": 0},
+            )
+            self.assertNotEqual(events[1]["input_hash"], _request_hash("private-value"))
+            self.assertNotIn("private-value", cassette.read_text(encoding="utf-8"))
+
+            offline = OfflineResponses()
+            with replaying_openai(
+                cassette,
+                privacy="transform",
+                sanitizer=mask_private_value,
+                patch_target=(OfflineResponses, "create"),
+            ):
+                response = offline.create(
+                    model="gpt-4.1-mini",
+                    input="private-value",
+                    metadata={"user": "private-value"},
+                    temperature=0,
+                    max_output_tokens=16,
+                )
+
+            self.assertEqual(response.output_text, "Hello from fake OpenAI.")
+
+    def test_cassette_writer_is_last_line_privacy_defense(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            cassette = Path(tempdir) / "writer-privacy.replay.jsonl"
+
+            with CassetteWriter(cassette) as writer:
+                written = writer.write_event(
+                    {
+                        "event": "tool.response",
+                        "trace_id": "tr_writer_privacy",
+                        "span_id": "sp_1",
+                        "output": {
+                            "message": "Bearer writer-token.123",
+                            "apiKey": "drop-me",
+                            "secret": "drop-secret",
+                            "token": "drop-token",
+                            "max_output_tokens": 16,
+                            "input_tokens": 8,
+                        },
+                    }
+                )
+
+            self.assertEqual(
+                written["output"],
+                {"message": "[REDACTED]", "max_output_tokens": 16, "input_tokens": 8},
+            )
+            self.assertEqual(written["output_hash"], hash_value(written["output"]))
+            raw = cassette.read_text(encoding="utf-8")
+            self.assertNotIn("writer-token", raw)
+            self.assertNotIn("drop-me", raw)
+            self.assertNotIn("drop-secret", raw)
+            self.assertNotIn("drop-token", raw)
+
+    def test_hide_all_privacy_mode_preserves_valid_structure_without_content_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            cassette = Path(tempdir) / "hidden.replay.jsonl"
+
+            with CassetteWriter(cassette, privacy="hide_all") as writer:
+                writer.write_event(
+                    {
+                        "event": "trace.start",
+                        "trace_id": "tr_hidden",
+                        "name": "hidden",
+                        "metadata": {"prompt": "secret"},
+                    }
+                )
+                writer.write_event(
+                    {
+                        "event": "llm.call",
+                        "trace_id": "tr_hidden",
+                        "span_id": "sp_1",
+                        "provider": "openai",
+                        "model": "gpt-4.1-mini",
+                        "input_hash": hash_value({"prompt": "secret"}),
+                        "params": {"temperature": 0},
+                    }
+                )
+                writer.write_event(
+                    {
+                        "event": "llm.response",
+                        "trace_id": "tr_hidden",
+                        "span_id": "sp_1",
+                        "output": {"text": "secret output"},
+                    }
+                )
+                writer.write_event(
+                    {
+                        "event": "trace.end",
+                        "trace_id": "tr_hidden",
+                        "status": "success",
+                        "output_hash": hash_value({"text": "secret output"}),
+                    }
+                )
+
+            events = _read_events(cassette)
+            self.assertNotIn("metadata", events[0])
+            self.assertEqual(events[1]["input_hash"], "hidden:payload")
+            self.assertNotIn("params", events[1])
+            self.assertEqual(events[2]["output"], {"value_hidden": True})
+            self.assertNotIn("output_hash", events[2])
+            self.assertNotIn("output_hash", events[3])
+            self.assertNotIn("secret", cassette.read_text(encoding="utf-8"))
+
+            _validate_with_go(cassette)
+
+    def test_hide_all_openai_recording_replays_with_hidden_input_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            cassette = Path(tempdir) / "hidden-openai.replay.jsonl"
+            fake = FakeResponses()
+
+            with recording_openai(
+                cassette,
+                name="hidden-openai",
+                privacy="hide_all",
+                patch_target=(FakeResponses, "create"),
+            ):
+                fake.create(
+                    model="gpt-4.1-mini",
+                    input="private prompt",
+                    temperature=0,
+                    max_output_tokens=16,
+                )
+
+            events = _read_events(cassette)
+            self.assertEqual(events[1]["input_hash"], "hidden:payload")
+            self.assertEqual(events[2]["output"], {"value_hidden": True})
+            self.assertNotIn("output_hash", events[2])
+
+            offline = OfflineResponses()
+            with replaying_openai(
+                cassette,
+                privacy="hide_all",
+                patch_target=(OfflineResponses, "create"),
+            ):
+                response = offline.create(
+                    model="gpt-4.1-mini",
+                    input="private prompt",
+                    temperature=0,
+                    max_output_tokens=16,
+                )
+
+            self.assertEqual(response.output, {"value_hidden": True})
 
     def test_failed_responses_create_records_error_and_restores_patch(self) -> None:
         original = FailingResponses.create

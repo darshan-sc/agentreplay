@@ -18,6 +18,7 @@ from typing import Any
 
 from .cassette_writer import ALLOWED_EVENTS, SCHEMA_VERSION, CassetteWriter
 from .hashing import canonical_json, hash_value
+from .privacy import PrivacyMode, redact_text, sanitize_payload, should_drop_key, unsupported_payload_marker
 
 _OMIT = object()
 _ACTIVE_CONTEXT = None
@@ -122,6 +123,8 @@ def recording_openai(
     *,
     name: str = "openai",
     metadata: Mapping[str, Any] | None = None,
+    privacy: PrivacyMode = "safe",
+    sanitizer=None,
     patch_target: tuple[type, str] | None = None,
 ) -> "OpenAIRecorder":
     """Record non-streaming OpenAI Responses API calls into a cassette.
@@ -130,17 +133,26 @@ def recording_openai(
     experiments. Normal callers should rely on the default OpenAI SDK target.
     """
 
-    return OpenAIRecorder(path, name=name, metadata=metadata, patch_target=patch_target)
+    return OpenAIRecorder(
+        path,
+        name=name,
+        metadata=metadata,
+        privacy=privacy,
+        sanitizer=sanitizer,
+        patch_target=patch_target,
+    )
 
 
 def replaying_openai(
     path: str | os.PathLike[str],
     *,
+    privacy: PrivacyMode = "safe",
+    sanitizer=None,
     patch_target: tuple[type, str] | None = None,
 ) -> "OpenAIReplayer":
     """Replay non-streaming OpenAI Responses API calls from a cassette."""
 
-    return OpenAIReplayer(path, patch_target=patch_target)
+    return OpenAIReplayer(path, privacy=privacy, sanitizer=sanitizer, patch_target=patch_target)
 
 
 def record_agent_step(
@@ -176,11 +188,15 @@ class OpenAIRecorder:
         *,
         name: str,
         metadata: Mapping[str, Any] | None,
+        privacy: PrivacyMode,
+        sanitizer,
         patch_target: tuple[type, str] | None,
     ) -> None:
         self.path = Path(path)
         self.name = name
         self.metadata = metadata or {}
+        self.privacy = privacy
+        self.sanitizer = sanitizer
         self.patch_target = patch_target
         self.trace_id = f"tr_{uuid.uuid4().hex}"
         self._span_counter = 0
@@ -199,7 +215,11 @@ class OpenAIRecorder:
         _ACTIVE_CONTEXT = self
 
         try:
-            self._writer = CassetteWriter(self.path).open()
+            self._writer = CassetteWriter(
+                self.path,
+                privacy=self.privacy,
+                sanitizer=self.sanitizer,
+            ).open()
             self._writer.write_event(
                 {
                     "event": "trace.start",
@@ -276,8 +296,8 @@ class OpenAIRecorder:
         span_id = self._next_span_id()
         model = _extract_model(args, kwargs)
         request_payload = _request_hash_payload(args, kwargs, model)
-        input_hash = hash_value(request_payload)
-        params = _request_params(kwargs)
+        input_hash = self._input_hash(request_payload)
+        params = self._sanitize_params(_request_params(kwargs))
 
         call_event: dict[str, Any] = {
             "event": "llm.call",
@@ -306,7 +326,7 @@ class OpenAIRecorder:
             )
             raise
 
-        output = _response_output(response)
+        output = sanitize_payload(_response_output(response))
         output_hash = hash_value(output)
         response_event: dict[str, Any] = {
             "event": "llm.response",
@@ -319,8 +339,8 @@ class OpenAIRecorder:
         usage = _response_usage(response)
         if usage:
             response_event["usage"] = usage
-        writer.write_event(response_event)
-        self._last_output_hash = output_hash
+        written_response = writer.write_event(response_event)
+        self._remember_output_hash(written_response)
         return response
 
     def _write_agent_step(
@@ -339,7 +359,8 @@ class OpenAIRecorder:
         _add_jsonable_field(event, "metadata", metadata)
         _add_jsonable_payload(event, "input", input)
         _add_jsonable_payload(event, "output", output)
-        self._require_writer().write_event(event)
+        written_event = self._require_writer().write_event(event)
+        self._remember_output_hash(written_event)
 
     def _write_tool_call(
         self,
@@ -378,7 +399,8 @@ class OpenAIRecorder:
             _add_jsonable_payload(event, "output", {} if output is _OMIT else output)
         if started is not None:
             event["latency_ms"] = _latency_ms(started)
-        self._require_writer().write_event(event)
+        written_event = self._require_writer().write_event(event)
+        self._remember_output_hash(written_event)
 
     def _write_trace_end(self, status: str) -> None:
         if self._trace_ended:
@@ -409,15 +431,33 @@ class OpenAIRecorder:
             self._writer = None
             writer.close()
 
+    def _remember_output_hash(self, event: Mapping[str, Any]) -> None:
+        output_hash = event.get("output_hash")
+        if isinstance(output_hash, str) and output_hash:
+            self._last_output_hash = output_hash
+
+    def _sanitize_hash_payload(self, payload: Any) -> Any:
+        return _sanitize_hash_payload(payload, privacy=self.privacy, sanitizer=self.sanitizer)
+
+    def _sanitize_params(self, params: dict[str, Any]) -> dict[str, Any]:
+        return _sanitize_params(params, privacy=self.privacy, sanitizer=self.sanitizer)
+
+    def _input_hash(self, payload: Any) -> str:
+        return _input_hash(payload, privacy=self.privacy, sanitizer=self.sanitizer)
+
 
 class OpenAIReplayer:
     def __init__(
         self,
         path: str | os.PathLike[str],
         *,
+        privacy: PrivacyMode,
+        sanitizer,
         patch_target: tuple[type, str] | None,
     ) -> None:
         self.path = Path(path)
+        self.privacy = privacy
+        self.sanitizer = sanitizer
         self.patch_target = patch_target
         self._target_owner: type | None = None
         self._target_method: str | None = None
@@ -489,8 +529,16 @@ class OpenAIReplayer:
         request = LLMReplayRequest(
             provider="openai",
             model=model,
-            input_hash=hash_value(_request_hash_payload(args, kwargs, model)),
-            params=_request_params(kwargs),
+            input_hash=_input_hash(
+                _request_hash_payload(args, kwargs, model),
+                privacy=self.privacy,
+                sanitizer=self.sanitizer,
+            ),
+            params=_sanitize_params(
+                _request_params(kwargs),
+                privacy=self.privacy,
+                sanitizer=self.sanitizer,
+            ),
         )
         exchange = self._index.match_llm(request)
         return RecordedOpenAIResponse(exchange.call, exchange.response)
@@ -884,10 +932,7 @@ def _recorded_payload_item(value: Any) -> Any:
 
 
 def _unsupported_payload_marker() -> dict[str, Any]:
-    return {
-        "value_unavailable": True,
-        "reason": "unsupported_type",
-    }
+    return unsupported_payload_marker()
 
 
 def _output_text_from_recorded(output: Any) -> str | None:
@@ -959,6 +1004,29 @@ def _request_params(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     return params
 
 
+def _sanitize_hash_payload(value: Any, *, privacy: PrivacyMode, sanitizer) -> Any:
+    if privacy == "transform":
+        if sanitizer is None:
+            raise ValueError("privacy mode 'transform' requires a sanitizer")
+        return sanitize_payload(sanitizer(value))
+    if privacy == "hide_all":
+        return {"value_hidden": True}
+    return sanitize_payload(value)
+
+
+def _input_hash(value: Any, *, privacy: PrivacyMode, sanitizer) -> str:
+    if privacy == "hide_all":
+        return "hidden:payload"
+    return hash_value(_sanitize_hash_payload(value, privacy=privacy, sanitizer=sanitizer))
+
+
+def _sanitize_params(params: dict[str, Any], *, privacy: PrivacyMode, sanitizer) -> dict[str, Any]:
+    if not params or privacy == "hide_all":
+        return {}
+    sanitized = _sanitize_hash_payload(params, privacy=privacy, sanitizer=sanitizer)
+    return sanitized if isinstance(sanitized, dict) else {}
+
+
 def _sanitize_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
     sanitized: dict[str, Any] = {}
     for key, item in value.items():
@@ -972,8 +1040,10 @@ def _sanitize_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _to_jsonable(value: Any) -> Any:
-    if value is None or isinstance(value, (str, bool, int)):
+    if value is None or isinstance(value, (bool, int)):
         return value
+    if isinstance(value, str):
+        return _redact_text(value)
     if isinstance(value, float):
         return value if math.isfinite(value) else _OMIT
     if isinstance(value, Mapping):
@@ -1011,14 +1081,9 @@ def _to_jsonable(value: Any) -> Any:
 
 
 def _drop_key(key: str) -> bool:
-    normalized = _normalize_key(key)
-    if normalized in _TRANSPORT_FIELDS:
+    if should_drop_key(key):
         return True
-    if normalized in _SENSITIVE_EXACT_KEYS:
-        return True
-    if normalized.endswith(("_password", "_secret", "_token")):
-        return True
-    return any(part in normalized for part in _SENSITIVE_KEY_PARTS)
+    return _normalize_key(key) in _TRANSPORT_FIELDS
 
 
 def _normalize_key(key: str) -> str:
@@ -1119,7 +1184,4 @@ def _latency_ms(started: float) -> int:
 
 
 def _redact_text(text: str) -> str:
-    redacted = text
-    for pattern in _SECRET_PATTERNS:
-        redacted = pattern.sub("[REDACTED]", redacted)
-    return redacted
+    return redact_text(text)
